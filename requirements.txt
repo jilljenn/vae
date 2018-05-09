@@ -1,0 +1,2 @@
+tensorflow
+git+https://github.com/thu-ml/zhusuan.git
