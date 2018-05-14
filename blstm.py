@@ -27,6 +27,7 @@ class BayesianLSTMCell(object):
 def bayesian_rnn(cell, inputs, y_i):
     initializer_c_h = (tf.zeros([batch_size, embedding_size]), tf.zeros([batch_size, embedding_size]))
     c_list, h_list = tf.scan(cell, inputs, initializer=initializer_c_h)
+    return h_list
 
     # If we're only interested in the last state
     # indices = tf.stack([seq_len, tf.range(batch_size)], axis=1)
@@ -34,13 +35,13 @@ def bayesian_rnn(cell, inputs, y_i):
     # logits = tf.squeeze(tf.layers.dense(relevant_outputs, 1), -1)
 
     # logits = tf.layers.dense(h_list, (nb_items * nb_classes))  # Not possible so we have to implement our own tensor product
-    Wo = tf.get_variable('weight', shape=(embedding_size, nb_items, nb_classes))
+    # Wo = tf.get_variable('weight', shape=(embedding_size, nb_items, nb_classes))
     # Well bias is missing, I'm lazy now, I just want the type check to shut up
 
-    logits = tf.tensordot(h_list, Wo, axes=1)  # shape = [max_seq_len, nb_batches, nb_items, nb_classes]
-    slicer = tf.one_hot(y_i, depth=nb_items)  # shape = [max_seq_len, nb_batches, nb_items (one-hot)]
-    relevant_logits = tf.einsum('ijkl,ijk->ijl', logits, slicer)  # shape = [max_seq_len, nb_batches, nb_classes]
-    return relevant_logits
+    # logits = tf.tensordot(h_list, Wo, axes=1)  # shape = [max_seq_len, nb_batches, nb_items, nb_classes]
+    # slicer = tf.one_hot(y_i, depth=nb_items)  # shape = [max_seq_len, nb_batches, nb_items (one-hot)]
+    # relevant_logits = tf.einsum('ijkl,ijk->ijl', logits, slicer)  # shape = [max_seq_len, nb_batches, nb_classes]
+    # return relevant_logits
 
 # Data
 embedding_size = 128
@@ -95,7 +96,12 @@ def p_net(observed, seq_len):
     '''
     with zs.BayesianNet(observed=observed) as model:
         cell = BayesianLSTMCell(128, forget_bias=0.)
-        logits = bayesian_rnn(cell, x, y_i)  # shape = [max_seq_len, nb_batches, nb_classes]
+        # shape was [max_seq_len, nb_batches, nb_classes]
+        h_list = bayesian_rnn(cell, x, y_i)
+        item_features = tf.get_variable("item_features", shape=[nb_items, embedding_size, nb_classes],
+                                        initializer=tf.truncated_normal_initializer(stddev=0.02))
+        relevant_items = tf.nn.embedding_lookup(item_features, y_i, name="feat_items")
+        logits = tf.tensordot(h_list, relevant_items, axes=[[2], [2]])  # That's not even the good shape but anyway
         _ = zs.Categorical('y_v', logits)  # shape of its local_log_prob = [max_seq_len, nb_batches]
                                            # because we already observe the true variable (y_v is in observed)
     return model
@@ -103,10 +109,10 @@ def p_net(observed, seq_len):
 def log_joint(observed):
     model = p_net(observed, seq_len)
     # print('all', model._stochastic_tensors)  # w and y_v
-    # log_pz, log_px_z = model.local_log_prob(['w', 'y_v'])  # Error
-    log_px_z = model.local_log_prob('y_v')
-    # return log_pz + log_px_z  # Error
-    return log_px_z
+    log_pz, log_px_z = model.local_log_prob(['w', 'y_v'])  # Error
+    # log_px_z = model.local_log_prob('y_v')
+    return log_pz + log_px_z  # Error
+    # return log_px_z
 
 joint_ll = log_joint({'x': x, 'y_i': y_i, 'y_v': y_v})
 cost = -joint_ll
