@@ -103,22 +103,25 @@ def p_net(observed, seq_len):
     Decoder: p(x|z) = p(y_v|w)
     '''
     pr = make_prior()
-    cell = BayesianLSTMCell(128, forget_bias=0., weights=pr.sample())
+    w = pr.sample()
+    cell = BayesianLSTMCell(128, forget_bias=0., weights=w)
     # shape was [max_seq_len, nb_batches, nb_classes]
-    h_list = bayesian_rnn(cell, x, y_i)
-    item_features = tf.get_variable("item_features", shape=[nb_items, embedding_size, nb_classes],
-                                    initializer=tf.truncated_normal_initializer(stddev=0.02))
-    relevant_items = tf.nn.embedding_lookup(item_features, y_i, name="feat_items")
-    logits = tf.tensordot(h_list, relevant_items, axes=[[2], [2]])  # That's not even the good shape but anyway
-    y = tfd.Categorical(logits=logits)  # shape of its local_log_prob = [max_seq_len, nb_batches]
+    relevant_logits = bayesian_rnn(cell, x, y_i)
+    # item_features = tf.get_variable("item_features", shape=[nb_items, embedding_size, nb_classes],
+    #                                 initializer=tf.truncated_normal_initializer(stddev=0.02))
+    # relevant_items = tf.nn.embedding_lookup(item_features, y_i, name="feat_items")
+    # print('hl', h_list)
+    # print('ri', relevant_items)
+    # logits = tf.tensordot(h_list, relevant_items, axes=[[2], [2]])  # That's not even the good shape but anyway
+    y = tfd.Categorical(logits=relevant_logits)  # shape of its local_log_prob = [max_seq_len, nb_batches]
                                        # because we already observe the true variable (y_v is in observed)
-    return pr, cell, y
+    return pr, w, cell, y
 
 def log_joint(observed):
-    pr, cell, y = p_net(observed, seq_len)
+    pr, w, cell, y = p_net(observed, seq_len)
     # print('all', model._stochastic_tensors)  # w and y_v
     # log_pz, log_px_z = model.local_log_prob(['w', 'y_v'])  # Error
-    log_pz = pr.log_prob()  # Je mets quoi là
+    log_pz = pr.log_prob(w)  # Je mets quoi là
     log_px_z = y.log_prob(y_v)
     # log_px_z = model.local_log_prob('y_v')
     return log_pz + log_px_z  # Error
