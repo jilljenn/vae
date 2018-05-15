@@ -7,7 +7,7 @@ import numpy as np
 @zs.reuse('model')
 def p_net(observed, n, x_dim, z_dim):
     '''
-    Encoder: p(x|z)
+    Decoder: p(x|z)
     '''
     with zs.BayesianNet(observed=observed) as model:
         z_mean = tf.zeros([n, z_dim])
@@ -22,7 +22,7 @@ def p_net(observed, n, x_dim, z_dim):
 @zs.reuse('variational')
 def q_net(x, z_dim):
     '''
-    Decoder: q(z|x)
+    Encoder: q(z|x)
     '''
     with zs.BayesianNet() as variational:
         lz_x = layers.fully_connected(tf.to_float(x), 500)

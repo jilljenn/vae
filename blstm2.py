@@ -63,25 +63,28 @@ nb_epochs = 10
 nb_items = 10
 items = {}
 data = [
-    [(1, 4), (2, 0), (3, 1)],  # , (3, 3)
+    [(1, 4), (2, 0), (3, 1), (3, 3)],
     [(1, 3), (2, 1), (3, 0)],
-    [(2, 0), (3, 1), (1, 2)],
+    [(2, 0), (3, 1)],
     [(2, 1), (3, 0), (1, 1)]
 ]
 nb_samples = len(data)
-seq_len = len(data[0])
+seq_lengths = np.array(list(map(len, data))) - 1
+max_seq_len = max(seq_lengths)
+
 iters = nb_samples // batch_size
-x_train = np.zeros((seq_len - 1, len(data), embedding_size))
-y_i_train = []
-y_v_train = []
+x_train = np.zeros((max_seq_len, len(data), embedding_size))
+y_i_train = np.zeros((max_seq_len, len(data)))
+y_v_train = np.zeros((max_seq_len, len(data)))
 for i_sample, sample in enumerate(data):
     for pos, (i, v) in enumerate(sample[:-1]):
         if (i, v) not in items:
             items[i, v] = np.random.random(embedding_size)
         x_train[pos, i_sample] = items[i, v]
     indices, values = zip(*sample[1:])
-    y_i_train.append(indices)
-    y_v_train.append(values)
+    print(indices, values, seq_lengths[i_sample], y_i_train.shape, y_v_train.shape)
+    y_i_train[:seq_lengths[i_sample], i_sample] = indices
+    y_v_train[:seq_lengths[i_sample], i_sample] = values
 y_i_train = np.array(y_i_train)
 y_v_train = np.array(y_v_train)
 
@@ -96,7 +99,7 @@ y_v_train = np.array(y_v_train)
 x = tf.placeholder(tf.float32, shape=[None, None, embedding_size], name='x')
 y_i = tf.placeholder(tf.int32, shape=[None, None], name='y_i')
 y_v = tf.placeholder(tf.int32, shape=[None, None], name='y_v')
-seq_len = tf.shape(x)[0]
+seq_len = tf.placeholder(tf.int32, shape=[None], name='seq_len')
 
 def p_net(observed, seq_len):
     '''
@@ -121,10 +124,12 @@ def log_joint(observed):
     pr, w, cell, y = p_net(observed, seq_len)
     # print('all', model._stochastic_tensors)  # w and y_v
     # log_pz, log_px_z = model.local_log_prob(['w', 'y_v'])  # Error
+    print('poids', cell._w)
+    print('values', y_v)
     log_pz = pr.log_prob(w)  # Je mets quoi là
     log_px_z = y.log_prob(y_v)
     # log_px_z = model.local_log_prob('y_v')
-    return log_pz + log_px_z  # Error
+    return tf.reduce_sum(log_pz) + log_px_z  # Error
     # return log_px_z
 
 joint_ll = log_joint({'x': x, 'y_i': y_i, 'y_v': y_v})
@@ -146,11 +151,18 @@ with tf.Session() as sess:
         np.random.shuffle(x_train)
         lbs = []
         for t in range(iters):
-            x_batch = x_train[:, t * batch_size:(t + 1) * batch_size]
-            y_i_batch = y_i_train[t * batch_size:(t + 1) * batch_size]
-            y_v_batch = y_v_train[t * batch_size:(t + 1) * batch_size]
+            seq_len_batch = seq_lengths[t * batch_size:(t + 1) * batch_size]
+            print('seq', seq_len_batch)
+            max_seq_len_batch = max(seq_len_batch)
+
+            x_batch = x_train[:max_seq_len_batch, :, t * batch_size:(t + 1) * batch_size]
+            y_i_batch = y_i_train[:max_seq_len_batch, t * batch_size:(t + 1) * batch_size]
+            y_v_batch = y_v_train[:max_seq_len_batch, t * batch_size:(t + 1) * batch_size]
+            print('x', x_batch)
+            print('yi', y_i_batch)
+            print('yv', y_v_batch)
             _, lb = sess.run([infer_op, cost],
-                             feed_dict={x: x_batch, y_i: y_i_batch, y_v: y_v_batch})
+                             feed_dict={x: x_batch, y_i: y_i_batch, y_v: y_v_batch, seq_len: seq_len_batch})
             lbs.append(lb)
 
         print('Epoch {}: Lower bound = {}'.format(

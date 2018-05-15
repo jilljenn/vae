@@ -92,7 +92,7 @@ seq_len = tf.shape(x)[0]
 @zs.reuse('model')
 def p_net(observed, seq_len):
     '''
-    Encoder: p(x|z) = p(y_v|w)
+    Decoder: p(x|z) = p(y_v|w)
     '''
     with zs.BayesianNet(observed=observed) as model:
         cell = BayesianLSTMCell(128, forget_bias=0.)
