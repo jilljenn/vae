@@ -47,16 +47,20 @@ def log_joint(observed):
     log_pz, log_px_z = model.local_log_prob(['z', 'x'])
     return log_pz + log_px_z
 
-enc = make_encoder(x)
-z = enc.sample()
-dec = make_decoder(z)
-pr = make_prior()
+q_net = make_encoder(x)
+z = q_net.sample()
+p_net = make_decoder(z)
+prior = make_prior()
+
+print('p(x|z)', p_net.log_prob(x))
+print('p(z)', prior.log_prob(z))
+print('q(z|x)', q_net.log_prob(z))
 
 lower_bound = tf.reduce_mean(
-    enc.log_prob(z) - dec.log_prob(x) - pr.log_prob(z))
+    p_net.log_prob(x) + prior.log_prob(z) - q_net.log_prob(z))
 
 optimizer = tf.train.AdamOptimizer(0.001)
-infer_op = optimizer.minimize(lower_bound)
+infer_op = optimizer.minimize(-lower_bound)  # Increase ELBO <=> Minimize -ELBO
 
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
