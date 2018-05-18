@@ -1,2 +1,4 @@
 tensorflow
-git+https://github.com/thu-ml/zhusuan.git
+scikit-learn
+scipy
+pandas

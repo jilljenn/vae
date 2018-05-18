@@ -3,18 +3,20 @@ import pandas as pd
 import pickle
 
 
-MAX = 200
-
 df = pd.read_csv('ml-latest-small/ratings.csv')
-df = df.query('movieId < 100')
+# df = df.query('movieId < 1000')
 print(df.head(), len(df))
 
 encode_user = dict(zip(df['userId'].unique(), range(10000)))
-encode_work = dict(zip(df['movieId'].unique(), range(10000)))
+encode_item = dict(zip(df['movieId'].unique(), range(10000)))
+encode_rating = lambda x: int(x >= 5)
 df['user_id'] = df['userId'].map(encode_user)
-df['item_id'] = df['movieId'].map(encode_work)
+df['item_id'] = df['movieId'].map(encode_item)
+df['value'] = df['rating'].map(encode_rating)
 
-ratings = coo_matrix((2 * df['rating'] - 1, (df['user_id'], df['item_id']))).tocsr()
+print(df.head())
+
+ratings = coo_matrix((df['value'], (df['user_id'], df['item_id']))).tocsr()
 nb_users, nb_items = ratings.shape
 print('here', len(df), 'ratings', nb_users, 'users', nb_items, 'items')
 
