@@ -1,5 +1,6 @@
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, log_loss
+from scipy.sparse import coo_matrix
 import tensorflow as tf
 import tensorflow.distributions as tfd
 import tensorflow.contrib.distributions as wtfd
@@ -13,7 +14,7 @@ import sys
 
 PATH = '/home/jj'
 # PATH = '/Users/jilljenn/code'
-DATA = 'movie'
+DATA = 'aaa'
 VERBOSE = True
 
 if DATA != 'movie':
@@ -37,8 +38,22 @@ else:
     df['item'] += nb_users  # FM format
     # X = np.array(df)
 
-train, test = train_test_split(df, test_size=0.2)
+nb_entries = len(df)
+
+rows = np.arange(nb_entries).repeat(2)
+cols = np.array(df[['user', 'item']]).flatten()
+data = np.ones(2 * len(entries))
+X_fm = coo_matrix((data, (rows, cols)), shape=(len(entries), nb_users + nb_items)).tocsr()
+
+i_train, i_test = train_test_split(list(range(nb_entries)), test_size=0.2)
+train = df.iloc[i_train]
+test = df.iloc[i_test]
 print(train.head())
+
+X_fm_train = X_fm[i_train]
+print(X_fm_train[:5])
+X_fm_test = X_fm[i_test]
+
 np_priors = np.zeros(nb_users + nb_items)
 for k, v in Counter(train['user']).items():
     np_priors[k] = v
@@ -53,14 +68,15 @@ X_test = np.array(test)
 nb_samples, _ = X_train.shape
 
 print('Nb samples', nb_samples)
-embedding_size = 20
+embedding_size = 2
 # batch_size = 5
-batch_size = 128
+# batch_size = 128
+batch_size = nb_samples // 20
 # batch_size = nb_samples  # All
 iters = nb_samples // batch_size
 print('Nb iters', iters)
 epochs = 200
-gamma = 0.1
+gamma = 0.001
 
 
 # tf.enable_eager_execution()  # Debug
@@ -116,6 +132,7 @@ def make_entity_bias(entity_batch):
 
 user_batch = tf.placeholder(tf.int32, shape=[None], name='user_batch')
 item_batch = tf.placeholder(tf.int32, shape=[None], name='item_batch')
+X_fm_batch = tf.placeholder(tf.int32, shape=[None, nb_users + nb_items], name='sparse_batch')
 outcomes = tf.placeholder(tf.int32, shape=[None], name='outcomes')
 
 mu0 = make_mu().sample()
@@ -165,7 +182,20 @@ def make_likelihood(feat_users, feat_items, bias_users, bias_items):
     logits = tf.reduce_sum(feat_users * feat_items, 1) + bias_users + bias_items
     return tfd.Bernoulli(logits)
 
+def make_sparse_pred(x):
+    x = tf.cast(x, tf.float32)
+    x2 = x  # Works if x only contains 1/0
+    w = tf.reshape(bias[:, 0], (-1, 1))  # Otherwise tf.matmul is crying
+    V = users[:, embedding_size:]
+    V2 = V ** 2
+    logits = (tf.squeeze(tf.matmul(x, w, a_is_sparse=True)) +
+              0.5 * tf.reduce_sum(tf.matmul(x, V, a_is_sparse=True) ** 2 -
+                                  tf.matmul(x2, V2, a_is_sparse=True), axis=1))
+    return tfd.Bernoulli(logits)
+
 likelihood = make_likelihood(feat_users, feat_items, bias_users, bias_items)
+sparse_pred = make_sparse_pred(X_fm_batch)
+pred2 = sparse_pred.mean()
 ll = make_likelihood(feat_users2, feat_items2, bias_users2, bias_items2)
 pred = likelihood.mean()
 # print(likelihood.log_prob([1, 0]))
@@ -178,18 +208,10 @@ print('posterior', q_user.log_prob(feat_users))
 print('bias prior', bias_user_prior.log_prob(bias_users))
 print('bias posterior', q_user_bias.log_prob(bias_users))
 
-# sys.exit(0)
-
 # sentinel = likelihood.log_prob(outcomes)
 # sentinel = bias_prior.log_prob(bias_users)
 sentinel = tf.reduce_sum(ll.log_prob(outcomes))
 sentinel2 = tf.reduce_sum(likelihood.log_prob(outcomes))
-
-print('tristesse', bias_user_prior.log_prob(all_bias))
-print('desespoir', q_entity_bias.log_prob(all_bias))
-print('stuff', emb_user_prior.log_prob(all_feat))
-
-# sys.exit(0)
 
 # elbo = tf.reduce_mean(
 #     user_rescale * item_rescale * likelihood.log_prob(outcomes) +
@@ -204,7 +226,14 @@ elbo3 = tf.reduce_sum(
     1/item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
                       emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)))
 
-elbo = (len(X_train) * tf.reduce_mean(ll.log_prob(outcomes)) +
+elbo = tf.reduce_mean(
+    len(X_train) * likelihood.log_prob(outcomes) +
+    (nb_users + nb_items) / 2 * (bias_user_prior.log_prob(bias_users) - q_user_bias.log_prob(bias_users) +
+                                 emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users) +
+                                 bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
+                                 emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)))
+
+elbo4 = (len(X_train) * tf.reduce_mean(ll.log_prob(outcomes)) +
         tf.reduce_sum(bias_user_prior.log_prob(all_bias) - q_entity_bias.log_prob(all_bias)) +
         tf.reduce_sum(emb_user_prior.log_prob(all_feat) - q_entity.log_prob(all_feat)))
 
@@ -215,15 +244,12 @@ elbo2 = tf.reduce_mean(
                      (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
                       emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)))
 
-# sys.exit(0)
-
 optimizer = tf.train.AdamOptimizer(gamma)  # 0.001
 # optimizer = tf.train.GradientDescentOptimizer(gamma)
 infer_op = optimizer.minimize(-elbo)
 
 y_train = X_train[:, 2]
 y_test = X_test[:, 2]
-
 
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
@@ -239,23 +265,29 @@ with tf.Session() as sess:
                                         outcomes: X_batch[:, 2]})
             lbs.append(lb)
 
-        train_pred = sess.run(pred, feed_dict={user_batch: X_train[:, 0],
-                                               item_batch: X_train[:, 1]})
+        print('train', X_test[0])
+        print('train fm', X_fm_test[0])
+        train_pred, train_pred2 = sess.run([pred, pred2], feed_dict={user_batch: X_train[:, 0],
+                                                                     item_batch: X_train[:, 1],
+                                                                     X_fm_batch: X_fm_train.todense()})
         if VERBOSE:
             print('Train ACC', np.mean(y_train == np.round(train_pred)))
             print('Train AUC', roc_auc_score(y_train, train_pred))
             print('Train NLL', log_loss(y_train, train_pred, eps=1e-6))
             print('Pred', y_train[:5], train_pred[:5])
+            print('Pred2', y_train[:5], train_pred2[:5])
 
-        test_pred = sess.run(pred, feed_dict={user_batch: X_test[:, 0],
-                                              item_batch: X_test[:, 1]})
-        if VERBOSE:
+        test_pred, test_pred2 = sess.run([pred, pred2], feed_dict={user_batch: X_test[:, 0],
+                                                                   item_batch: X_test[:, 1],
+                                                                   X_fm_batch: X_fm_test.todense()})
+        if VERBOSE or epoch == epochs or epoch % 10 == 0:
             print('Test ACC', np.mean(y_test == np.round(test_pred)))
             print('Test AUC', roc_auc_score(y_test, test_pred))
             print('Test NLL', log_loss(y_test, test_pred, eps=1e-6))
             print('Pred', y_test[:5], test_pred[:5])
+            print('Pred2', y_test[:5], test_pred2[:5])
 
         print('Epoch {}: Lower bound = {} Other = {} Other = {}'.format(
-              epoch, np.mean(lbs), lb2, lb3))
+              epoch, np.mean(lbs) / len(X_train), lb2, lb3))
         # print('Sentinels', test, test2)
         # print(users[-8:].eval())
