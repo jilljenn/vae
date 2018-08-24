@@ -1,6 +1,9 @@
 import tensorflow as tf
 import tensorflow.distributions as tfd
 import tensorflow.contrib.distributions as wtfd
+from scipy.sparse import coo_matrix, load_npz, find
+import numpy as np
+
 
 tf.enable_eager_execution()
 
@@ -21,3 +24,13 @@ print(test)
 print(tf.reduce_sum(test))
 print(test.numpy().sum())
 print(prior2.log_prob(draw))
+
+# X_fm_batch = tf.sparse_placeholder(tf.int32, shape=[None, nb_users + nb_items], name='sparse_batch')
+# outcomes = tf.placeholder(tf.float32, shape=[None], name='outcomes')
+
+X = load_npz('data/mangaki/X_fm.npz')
+rows, cols, data = find(X)
+wow = tf.SparseTensorValue(np.column_stack((rows, cols)), X.shape, data)
+#print(tf.constant(wow))
+print(wow)
+print(wow[0])

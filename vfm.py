@@ -1,23 +1,62 @@
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, log_loss
-from scipy.sparse import coo_matrix
+from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error
+from scipy.sparse import coo_matrix, load_npz, save_npz
 import tensorflow as tf
 import tensorflow.distributions as tfd
-import tensorflow.contrib.distributions as wtfd
+import tensorflow_probability as tfp
+wtfd = tfp.distributions
 from collections import Counter
 import os.path
+import getpass
 import pandas as pd
 import numpy as np
 import yaml
+import time
 import sys
 
 
-PATH = '/home/jj'
-# PATH = '/Users/jilljenn/code'
-DATA = 'aaa'
-VERBOSE = True
+if getpass.getuser() == 'jj':
+    PATH = '/home/jj'
+else:
+    PATH = '/Users/jilljenn/code'
 
-if DATA != 'movie':
+# DATA = 'movielens'
+DATA = 'mangaki'
+VERBOSE = False
+
+# Load data
+if DATA == 'mangaki':
+    with open(os.path.join(PATH, 'vae/data/mangaki/config.yml')) as f:
+        config = yaml.load(f)
+        nb_users = config['nb_users']
+        nb_items = config['nb_items']
+
+    df = pd.read_csv(os.path.join(PATH, 'vae/data/mangaki/data.csv'))
+    df['item'] += nb_users
+    print(df.head())  
+elif DATA == 'movielens':
+    with open(os.path.join(PATH, 'vae/data/movie100k/config.yml')) as f:
+        config = yaml.load(f)
+        nb_users = config['nb_users']
+        nb_items = config['nb_items']
+
+    train = pd.read_csv(os.path.join(PATH, 'vae/data/movie100k/movie100k_train.csv'))
+    print(train.shape)
+    test = pd.read_csv(os.path.join(PATH, 'vae/data/movie100k/movie100k_test.csv'))
+    print(test.shape)
+    df = pd.concat((train, test))
+    df['item'] += nb_users  # FM format  # OMG I forgot this
+    print(df.shape)
+    print(df.head())
+elif DATA == 'movie':
+    with open(os.path.join(PATH, 'vae/data/movie100k/config.yml')) as f:
+        config = yaml.load(f)
+        nb_users = config['nb_users']
+        nb_items = config['nb_items']
+    df = pd.read_csv(os.path.join(PATH, 'vae/data/movie100k/data.csv'))
+    df['item'] += nb_users  # FM format
+    # X = np.array(df)
+else:  # Default is Fraction    
     ratings = np.load('fraction.npy')
     print('Fraction data loaded')
 
@@ -29,21 +68,20 @@ if DATA != 'movie':
             entries.append([i, nb_users + j, ratings[i][j]])  # FM format
     df = pd.DataFrame(entries, columns=('user', 'item', 'outcome'))
     # X_train = np.array(X_train)
-else:
-    with open(os.path.join(PATH, 'vae/data/movie100k/config.yml')) as f:
-        config = yaml.load(f)
-        nb_users = config['nb_users']
-        nb_items = config['nb_items']
-    df = pd.read_csv(os.path.join(PATH, 'vae/data/movie100k/data.csv'))
-    df['item'] += nb_users  # FM format
-    # X = np.array(df)
 
 nb_entries = len(df)
 
+# Build sparse features
 rows = np.arange(nb_entries).repeat(2)
 cols = np.array(df[['user', 'item']]).flatten()
-data = np.ones(2 * len(entries))
-X_fm = coo_matrix((data, (rows, cols)), shape=(len(entries), nb_users + nb_items)).tocsr()
+data = np.ones(2 * nb_entries)
+X_fm = coo_matrix((data, (rows, cols)), shape=(nb_entries, nb_users + nb_items)).tocsr()
+try:
+    y_fm = np.array(df['rating'])
+except:
+    y_fm = np.array(df['outcome']).astype(np.float32)
+save_npz(os.path.join(PATH, 'vae/data/mangaki/X_fm.npz'), X_fm)
+np.save(os.path.join(PATH, 'vae/data/mangaki/y_fm.npy'), y_fm)
 
 i_train, i_test = train_test_split(list(range(nb_entries)), test_size=0.2)
 train = df.iloc[i_train]
@@ -56,30 +94,59 @@ X_fm_test = X_fm[i_test]
 
 np_priors = np.zeros(nb_users + nb_items)
 for k, v in Counter(train['user']).items():
-    np_priors[k] = v
+    np_priors[int(k)] = v
 for k, v in Counter(train['item']).items():
-    np_priors[k] = v
+    np_priors[int(k)] = v
 print('minimax', np_priors.min(), np_priors.max())
 print(np_priors[nb_users - 5:nb_users + 5])
 
-X_train = np.array(train)
-X_test = np.array(test)
+X_train = np.array(train[['user', 'item']])
+try:
+    y_train = np.array(train['rating']).astype(np.float32)
+except:
+    y_train = np.array(train['outcome']).astype(np.float32)
+# y_train_bin = np.array(train['outcome'])
+nb_train_samples = len(X_train)
+
+X_test = np.array(test[['user', 'item']])
+try:
+    y_test = np.array(test['rating']).astype(np.float32)
+except:
+    y_test = np.array(test['outcome']).astype(np.float32)
+# y_test_bin = np.array(test['outcome'])
+nb_test_samples = len(X_test)
 
 nb_samples, _ = X_train.shape
 
+# Config
 print('Nb samples', nb_samples)
-embedding_size = 2
+embedding_size = 20
 # batch_size = 5
 # batch_size = 128
-batch_size = nb_samples // 20
+# batch_size = nb_samples // 1000
+batch_size = nb_samples // 100
+# batch_size = nb_samples // 20
 # batch_size = nb_samples  # All
 iters = nb_samples // batch_size
 print('Nb iters', iters)
-epochs = 200
-gamma = 0.001
+epochs = 500
+gamma = 0.05  # gamma 0.001 works better for classification
 
+dt = time.time()
+print('Start')
 
-# tf.enable_eager_execution()  # Debug
+# Handle data
+# X_data = tf.data.Dataset.from_tensor_slices(X_fm_train)
+# y_data = tf.data.Dataset.from_tensor_slices(y_train)
+# user_data = tf.data.Dataset.from_tensor_slices(X_train[:, 0])
+# item_data = tf.data.Dataset.from_tensor_slices(X_train[:, 1])
+# dataset = tf.data.Dataset.zip((X_data, y_data, user_data, item_data)).batch(batch_size)
+# iterator = dataset.make_initializable_iterator()
+# X_fm_batch, outcomes, user_batch, item_batch = iterator.get_next()
+
+print('Stop', time.time() - dt)  # 16 seconds pour Movielens
+
+# tf.enable_eager_execution()  # Debug, impossible with batches
 
 users = tf.get_variable('entities', shape=[nb_users + nb_items, 2 * embedding_size])
 bias = tf.get_variable('bias', shape=[nb_users + nb_items, 2])
@@ -132,8 +199,8 @@ def make_entity_bias(entity_batch):
 
 user_batch = tf.placeholder(tf.int32, shape=[None], name='user_batch')
 item_batch = tf.placeholder(tf.int32, shape=[None], name='item_batch')
-X_fm_batch = tf.placeholder(tf.int32, shape=[None, nb_users + nb_items], name='sparse_batch')
-outcomes = tf.placeholder(tf.int32, shape=[None], name='outcomes')
+X_fm_batch = tf.sparse_placeholder(tf.int32, shape=[None, nb_users + nb_items], name='sparse_batch')
+outcomes = tf.placeholder(tf.float32, shape=[None], name='outcomes')
 
 mu0 = make_mu().sample()
 lambda0 = make_lambda().sample()
@@ -178,13 +245,18 @@ item_rescale = tf.nn.embedding_lookup(priors, item_batch)[:, 0]
 # for _ in range(3):
 #     print(prior.sample([2]))
 
+# Predictions
 def make_likelihood(feat_users, feat_items, bias_users, bias_items):
     logits = tf.reduce_sum(feat_users * feat_items, 1) + bias_users + bias_items
     return tfd.Bernoulli(logits)
 
+def make_likelihood_reg(feat_users, feat_items, bias_users, bias_items):
+    logits = tf.reduce_sum(feat_users * feat_items, 1) + bias_users + bias_items
+    return tfd.Normal(logits, scale=0.1)
+
 def make_sparse_pred(x):
     x = tf.cast(x, tf.float32)
-    x2 = x  # Works if x only contains 1/0
+    x2 = x ** 2
     w = tf.reshape(bias[:, 0], (-1, 1))  # Otherwise tf.matmul is crying
     V = users[:, embedding_size:]
     V2 = V ** 2
@@ -193,8 +265,22 @@ def make_sparse_pred(x):
                                   tf.matmul(x2, V2, a_is_sparse=True), axis=1))
     return tfd.Bernoulli(logits)
 
-likelihood = make_likelihood(feat_users, feat_items, bias_users, bias_items)
-sparse_pred = make_sparse_pred(X_fm_batch)
+def make_sparse_pred_reg(x):
+    x = tf.cast(x, tf.float32)
+    x2 = x# ** 2  # FIXME if x is 0/1 it's okay
+    w = tf.reshape(all_bias, (-1, 1))
+    # w = tf.reshape(bias[:, 0], (-1, 1))  # Otherwise tf.matmul is crying
+    # V = users[:, embedding_size:]
+    V = all_feat
+    V2 = V ** 2
+    logits = (tf.squeeze(tf.sparse_tensor_dense_matmul(x, w)) +
+              0.5 * tf.reduce_sum(tf.sparse_tensor_dense_matmul(x, V) ** 2 -
+                                  tf.sparse_tensor_dense_matmul(x2, V2), axis=1))
+    return tfd.Normal(logits, scale=0.01)
+
+# likelihood = make_likelihood(feat_users, feat_items, bias_users, bias_items)
+likelihood = make_likelihood_reg(feat_users, feat_items, bias_users, bias_items)
+sparse_pred = make_sparse_pred_reg(X_fm_batch)
 pred2 = sparse_pred.mean()
 ll = make_likelihood(feat_users2, feat_items2, bias_users2, bias_items2)
 pred = likelihood.mean()
@@ -227,13 +313,15 @@ elbo3 = tf.reduce_sum(
                       emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)))
 
 elbo = tf.reduce_mean(
-    len(X_train) * likelihood.log_prob(outcomes) +
+    # len(X_train) * likelihood.log_prob(outcomes) +
+    len(X_train) * sparse_pred.log_prob(outcomes) +
     (nb_users + nb_items) / 2 * (bias_user_prior.log_prob(bias_users) - q_user_bias.log_prob(bias_users) +
                                  emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users) +
                                  bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
                                  emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)))
 
-elbo4 = (len(X_train) * tf.reduce_mean(ll.log_prob(outcomes)) +
+elbo4 = (# len(X_train) * tf.reduce_mean(ll.log_prob(outcomes)) +
+        len(X_train) * sparse_pred.log_prob(outcomes) +
         tf.reduce_sum(bias_user_prior.log_prob(all_bias) - q_entity_bias.log_prob(all_bias)) +
         tf.reduce_sum(emb_user_prior.log_prob(all_feat) - q_entity.log_prob(all_feat)))
 
@@ -248,46 +336,75 @@ optimizer = tf.train.AdamOptimizer(gamma)  # 0.001
 # optimizer = tf.train.GradientDescentOptimizer(gamma)
 infer_op = optimizer.minimize(-elbo)
 
-y_train = X_train[:, 2]
-y_test = X_test[:, 2]
+indices_train = np.column_stack((np.arange(nb_train_samples).repeat(2), X_train.flatten()))
+indices_test = np.column_stack((np.arange(nb_test_samples).repeat(2), X_test.flatten()))
+
 
 with tf.Session() as sess:
     sess.run(tf.global_variables_initializer())
 
     for epoch in range(1, epochs + 1):
-        np.random.shuffle(X_train)
+        # sess.run(iterator.initializer)
+        # np.random.shuffle(X_train)
+        # np.random.shuffle(X_fm_train)
         lbs = []
-        for t in range(iters):
-            X_batch = X_train[t * batch_size:(t + 1) * batch_size]
-            _, lb, lb2, lb3, test, test2 = sess.run([infer_op, elbo, elbo2, elbo3, sentinel, sentinel2],
-                             feed_dict={user_batch: X_batch[:, 0],
-                                        item_batch: X_batch[:, 1],
-                                        outcomes: X_batch[:, 2]})
-            lbs.append(lb)
+        # c = 0
+        dt = time.time()
+        for nb_iter in range(iters):
+            dt0 = time.time()
+            batch_ids = np.random.randint(0, nb_train_samples, size=batch_size)
+            # x_batch, y_batch = sess.run(next_element)
+            X_batch = X_train[batch_ids]
+            # print(X_batch.shape, batch_size)
+            # X_batch = X_fm_train[t * batch_size:(t + 1) * batch_size]
+            # y_batch = y_train[t * batch_size:(t + 1) * batch_size]
+            # print(X_fm_train[batch_ids].shape)
+            # print(type(X_fm_train[batch_ids]))
+            # print(type(X_fm_train))
+            # print(y_train[batch_ids].shape)
 
-        print('train', X_test[0])
-        print('train fm', X_fm_test[0])
-        train_pred, train_pred2 = sess.run([pred, pred2], feed_dict={user_batch: X_train[:, 0],
-                                                                     item_batch: X_train[:, 1],
-                                                                     X_fm_batch: X_fm_train.todense()})
+            indices = np.column_stack((np.arange(batch_size).repeat(2), X_batch.flatten()))
+
+            _, lb = sess.run([infer_op, elbo], feed_dict={user_batch: X_batch[:, 0],
+                                                          item_batch: X_batch[:, 1],
+                                                          outcomes: y_train[batch_ids],
+                                                          X_fm_batch: tf.SparseTensorValue(indices, np.ones(2 * batch_size), [batch_size, nb_users + nb_items])})
+                                                          #X_fm_batch: X_fm_train[batch_ids]})
+            lbs.append(lb)
+            if nb_iter == 0:
+                print(iters, 'times', time.time() - dt0)
+
+            #except tf.errors.OutOfRangeError:
+        # print('train', X_test[0])
+        # print('train fm', X_fm_test[0])
         if VERBOSE:
+            train_pred, train_pred2 = sess.run([pred, pred2], feed_dict={user_batch: X_train[:, 0],
+                                                                     item_batch: X_train[:, 1],
+                                                                     X_fm_batch: tf.SparseTensorValue(indices_train, np.ones(2 * nb_train_samples), [nb_train_samples, nb_users + nb_items])})
+                                                                     # X_fm_batch: X_fm_train})
+        
             print('Train ACC', np.mean(y_train == np.round(train_pred)))
-            print('Train AUC', roc_auc_score(y_train, train_pred))
-            print('Train NLL', log_loss(y_train, train_pred, eps=1e-6))
+            #print('Train AUC', roc_auc_score(y_train, train_pred))
+            #print('Train NLL', log_loss(y_train, train_pred, eps=1e-6))
+            print('Train RMSE', mean_squared_error(y_train, train_pred) ** 0.5)
+            print('Train2 RMSE', mean_squared_error(y_train, train_pred2) ** 0.5)
             print('Pred', y_train[:5], train_pred[:5])
             print('Pred2', y_train[:5], train_pred2[:5])
 
-        test_pred, test_pred2 = sess.run([pred, pred2], feed_dict={user_batch: X_test[:, 0],
-                                                                   item_batch: X_test[:, 1],
-                                                                   X_fm_batch: X_fm_test.todense()})
         if VERBOSE or epoch == epochs or epoch % 10 == 0:
+            test_pred, test_pred2 = sess.run([pred, pred2], feed_dict={user_batch: X_test[:, 0],
+                                                                   item_batch: X_test[:, 1],
+                                                                   X_fm_batch: tf.SparseTensorValue(indices_test, np.ones(2 * nb_test_samples), [nb_test_samples, nb_users + nb_items])})
+                                                                   # X_fm_batch: X_fm_test})
+
             print('Test ACC', np.mean(y_test == np.round(test_pred)))
-            print('Test AUC', roc_auc_score(y_test, test_pred))
-            print('Test NLL', log_loss(y_test, test_pred, eps=1e-6))
+            # print('Test AUC', roc_auc_score(y_test, test_pred))
+            # print('Test NLL', log_loss(y_test, test_pred, eps=1e-6))
+            print('Test RMSE', mean_squared_error(y_test, test_pred) ** 0.5)
+            print('Test2 RMSE', mean_squared_error(y_test, test_pred2) ** 0.5)
             print('Pred', y_test[:5], test_pred[:5])
             print('Pred2', y_test[:5], test_pred2[:5])
 
-        print('Epoch {}: Lower bound = {} Other = {} Other = {}'.format(
-              epoch, np.mean(lbs) / len(X_train), lb2, lb3))
-        # print('Sentinels', test, test2)
-        # print(users[-8:].eval())
+        print('{:.3f}s Epoch {}: Lower bound = {}'.format(
+              time.time() - dt, epoch, np.mean(lbs) / nb_train_samples))
+        # break
