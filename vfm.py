@@ -6,6 +6,7 @@ import tensorflow.distributions as tfd
 import tensorflow_probability as tfp
 wtfd = tfp.distributions
 from collections import Counter
+import argparse
 import os.path
 import getpass
 import pandas as pd
@@ -15,13 +16,19 @@ import time
 import sys
 
 
+parser = argparse.ArgumentParser(description='Run VFM')
+parser.add_argument('data', type=str, nargs='?', default='movie100k')
+options = parser.parse_args()
+
+
 if getpass.getuser() == 'jj':
     PATH = '/home/jj'
 else:
     PATH = '/Users/jilljenn/code'
 
-# DATA = 'movielens'
-DATA = 'mangaki'
+DATA = 'movie100k'
+DATA = options.data
+# DATA = 'mangaki'
 VERBOSE = False
 
 # Load data
@@ -34,7 +41,7 @@ if DATA == 'mangaki':
     df = pd.read_csv(os.path.join(PATH, 'vae/data/mangaki/data.csv'))
     df['item'] += nb_users
     print(df.head())  
-elif DATA == 'movielens':
+elif DATA == 'movie100k':
     with open(os.path.join(PATH, 'vae/data/movie100k/config.yml')) as f:
         config = yaml.load(f)
         nb_users = config['nb_users']
@@ -80,8 +87,8 @@ try:
     y_fm = np.array(df['rating'])
 except:
     y_fm = np.array(df['outcome']).astype(np.float32)
-save_npz(os.path.join(PATH, 'vae/data/mangaki/X_fm.npz'), X_fm)
-np.save(os.path.join(PATH, 'vae/data/mangaki/y_fm.npy'), y_fm)
+save_npz(os.path.join(PATH, 'vae/data', DATA, 'X_fm.npz'), X_fm)
+np.save(os.path.join(PATH, 'vae/data', DATA, 'y_fm.npy'), y_fm)
 
 i_train, i_test = train_test_split(list(range(nb_entries)), test_size=0.2)
 train = df.iloc[i_train]
@@ -124,13 +131,14 @@ embedding_size = 20
 # batch_size = 5
 # batch_size = 128
 # batch_size = nb_samples // 1000
-batch_size = nb_samples // 100
+# batch_size = nb_samples // 100
 # batch_size = nb_samples // 20
-# batch_size = nb_samples  # All
+batch_size = nb_samples  # All
 iters = nb_samples // batch_size
 print('Nb iters', iters)
 epochs = 500
-gamma = 0.05  # gamma 0.001 works better for classification
+gamma = 0.1  # gamma 0.001 works better for classification
+sigma = 0.8
 
 dt = time.time()
 print('Start')
@@ -252,7 +260,7 @@ def make_likelihood(feat_users, feat_items, bias_users, bias_items):
 
 def make_likelihood_reg(feat_users, feat_items, bias_users, bias_items):
     logits = tf.reduce_sum(feat_users * feat_items, 1) + bias_users + bias_items
-    return tfd.Normal(logits, scale=0.1)
+    return tfd.Normal(logits, scale=sigma)
 
 def make_sparse_pred(x):
     x = tf.cast(x, tf.float32)
@@ -276,7 +284,7 @@ def make_sparse_pred_reg(x):
     logits = (tf.squeeze(tf.sparse_tensor_dense_matmul(x, w)) +
               0.5 * tf.reduce_sum(tf.sparse_tensor_dense_matmul(x, V) ** 2 -
                                   tf.sparse_tensor_dense_matmul(x2, V2), axis=1))
-    return tfd.Normal(logits, scale=0.01)
+    return tfd.Normal(logits, scale=sigma)
 
 # likelihood = make_likelihood(feat_users, feat_items, bias_users, bias_items)
 likelihood = make_likelihood_reg(feat_users, feat_items, bias_users, bias_items)
