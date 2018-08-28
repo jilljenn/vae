@@ -2,6 +2,7 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error
 from scipy.sparse import coo_matrix, load_npz, save_npz
 from tensorflow.python import debug as tf_debug
+from datetime import datetime
 import tensorflow as tf
 import tensorflow.distributions as tfd
 import tensorflow_probability as tfp
@@ -13,6 +14,7 @@ import getpass
 import pandas as pd
 import numpy as np
 import yaml
+import json
 import time
 import sys
 
@@ -20,6 +22,7 @@ import sys
 parser = argparse.ArgumentParser(description='Run VFM')
 parser.add_argument('data', type=str, nargs='?', default='fraction')
 parser.add_argument('--degenerate', type=bool, nargs='?', const=True, default=False)
+parser.add_argument('--epochs', type=int, nargs='?', default=500)
 options = parser.parse_args()
 
 
@@ -139,13 +142,13 @@ embedding_size = 20
 # batch_size = 1
 # batch_size = 5
 # batch_size = 128
-batch_size = nb_samples // 1000
+# batch_size = nb_samples // 1000
 # batch_size = nb_samples // 100
 # batch_size = nb_samples // 20
-# batch_size = nb_samples  # All
+batch_size = nb_samples  # All
 iters = nb_samples // batch_size
 print('Nb iters', iters)
-epochs = 500
+epochs = options.epochs
 gamma = 0.01  # gamma 0.001 works better for classification
 sigma = 0.2  # 0.8
 
@@ -507,9 +510,20 @@ with tf.Session() as sess:
                                                                        X_fm_batch: X_test_sp_tf})
                                                                        # X_fm_batch: X_fm_test})
 
-    print('Final Test ACC', np.mean(y_test == np.round(test_pred)))
+    metrics = {
+        'acc': np.mean(y_test == np.round(test_pred)),
+        'rmse': mean_squared_error(y_test, test_pred) ** 0.5
+    }
+    print('Final Test ACC', metrics['acc'])
     # print('Test AUC', roc_auc_score(y_test, test_pred))
     # print('Test NLL', log_loss(y_test, test_pred, eps=1e-6))
-    print('Final Test RMSE', mean_squared_error(y_test, test_pred) ** 0.5)
+    print('Final Test RMSE', metrics['rmse'])
     # print('Test2 RMSE', mean_squared_error(y_test, test_pred2) ** 0.5)
     print('Final Pred', y_test[:5], test_pred[:5])
+
+filename = '{:s}-{:s}.txt'.format(DATA, datetime.now().isoformat())
+with open('results/{:s}'.format(filename), 'w') as f:
+    f.write(json.dumps({
+        'args': vars(options),
+        'metrics': metrics
+    }, indent=4))
