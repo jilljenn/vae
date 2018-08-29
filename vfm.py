@@ -19,10 +19,18 @@ import time
 import sys
 
 
+DESCRIPTION = 'Not yet global_bias variational approximation, not yet classification'
+
 parser = argparse.ArgumentParser(description='Run VFM')
 parser.add_argument('data', type=str, nargs='?', default='fraction')
 parser.add_argument('--degenerate', type=bool, nargs='?', const=True, default=False)
+parser.add_argument('--sparse', type=bool, nargs='?', const=True, default=False)
+
 parser.add_argument('--epochs', type=int, nargs='?', default=500)
+parser.add_argument('--d', type=int, nargs='?', default=20)
+parser.add_argument('--gamma', type=float, nargs='?', default=0.01)
+parser.add_argument('--sigma2', type=float, nargs='?', default=0.2)
+parser.add_argument('--nb_batches', type=int, nargs='?', default=1000)
 options = parser.parse_args()
 
 
@@ -32,6 +40,7 @@ else:
     PATH = '/Users/jilljenn/code'
 
 DATA = options.data
+print('Data is', DATA)
 VERBOSE = False
 
 # Load data
@@ -69,7 +78,7 @@ elif DATA == 'movie':
     df = pd.read_csv(os.path.join(PATH, 'vae/data/movie100k/data.csv'))
     df['item'] += nb_users  # FM format
     # X = np.array(df)
-else:  # Default is Fraction    
+else:  # Default is Fraction
     ratings = np.load('fraction.npy')
     print('Fraction data loaded')
 
@@ -138,19 +147,17 @@ nb_samples, _ = X_train.shape
 
 # Config
 print('Nb samples', nb_samples)
-embedding_size = 20
+embedding_size = options.d
 # batch_size = 1
 # batch_size = 5
 # batch_size = 128
-# batch_size = nb_samples // 1000
-# batch_size = nb_samples // 100
-# batch_size = nb_samples // 20
-batch_size = nb_samples  # All
-iters = nb_samples // batch_size
-print('Nb iters', iters)
+nb_iters = options.nb_batches
+batch_size = nb_samples // nb_iters  # All
+print('Nb iters', nb_iters)
+
 epochs = options.epochs
-gamma = 0.01  # gamma 0.001 works better for classification
-sigma = 0.2  # 0.8
+gamma = options.gamma  # gamma 0.001 works better for classification
+sigma2 = options.sigma2  # 0.8
 
 dt = time.time()
 print('Start')
@@ -238,7 +245,7 @@ outcomes = tf.placeholder(tf.float32, shape=[None], name='outcomes')
 # mu0 = make_mu().sample()
 # lambda0 = make_lambda().sample()
 
-# all_entities = tf.constant(np.arange(nb_users + nb_items))
+all_entities = tf.constant(np.arange(nb_users + nb_items))
 
 if options.degenerate:
     emb_user_prior = make_embedding_prior()
@@ -261,10 +268,10 @@ q_item = make_user_posterior(item_batch)
 q_user_bias = make_entity_bias(user_batch)
 q_item_bias = make_entity_bias(item_batch)
 
-# q_entity = make_user_posterior(all_entities)
-# q_entity_bias = make_entity_bias(all_entities)
-# all_bias = q_entity_bias.sample()
-# all_feat = q_entity.sample()
+q_entity = make_user_posterior(all_entities)
+q_entity_bias = make_entity_bias(all_entities)
+all_bias = q_entity_bias.sample()
+all_feat = q_entity.sample()
 # feat_users2 = tf.nn.embedding_lookup(all_feat, user_batch)
 # feat_items2 = tf.nn.embedding_lookup(all_feat, item_batch)
 # bias_users2 = tf.nn.embedding_lookup(all_bias, user_batch)
@@ -294,7 +301,7 @@ def make_likelihood(feat_users, feat_items, bias_users, bias_items):
 
 def make_likelihood_reg(feat_users, feat_items, bias_users, bias_items):
     logits = global_bias + tf.reduce_sum(feat_users * feat_items, 1) + bias_users + bias_items
-    return tfd.Normal(logits, scale=sigma, name='pred')
+    return tfd.Normal(logits, scale=sigma2, name='pred')
 
 def make_sparse_pred(x):
     x = tf.cast(x, tf.float32)
@@ -318,12 +325,12 @@ def make_sparse_pred_reg(x):
     logits = (tf.squeeze(tf.sparse_tensor_dense_matmul(x, w)) +
               0.5 * tf.reduce_sum(tf.sparse_tensor_dense_matmul(x, V) ** 2 -
                                   tf.sparse_tensor_dense_matmul(x2, V2), axis=1))
-    return tfd.Normal(logits, scale=sigma)
+    return tfd.Normal(logits, scale=sigma2)
 
 # likelihood = make_likelihood(feat_users, feat_items, bias_users, bias_items)
 likelihood = make_likelihood_reg(feat_users, feat_items, bias_users, bias_items)
-# sparse_pred = make_sparse_pred_reg(X_fm_batch)
-# pred2 = sparse_pred.mean()
+sparse_pred = make_sparse_pred_reg(X_fm_batch)
+pred2 = sparse_pred.mean()
 # ll = make_likelihood(feat_users2, feat_items2, bias_users2, bias_items2)
 pred = likelihood.mean()
 # print(likelihood.log_prob([1, 0]))
@@ -362,6 +369,14 @@ if options.degenerate:
                                      emb_user_prior.log_prob(feat_items)), name='elbo')
 # / 2 : 1.27
 # * 2 : 1.16
+elif options.sparse:
+    elbo = tf.reduce_mean(
+        # len(X_train) * likelihood.log_prob(outcomes) +
+        len(X_train) * sparse_pred.log_prob(outcomes) +
+        len(X_train) * 1/user_rescale * (bias_user_prior.log_prob(bias_users) - q_user_bias.log_prob(bias_users) +
+                          emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users)) +
+        len(X_train) * 1/item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
+                          emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo')
 else:
     # elbo = tf.reduce_mean(
     #     len(X_train) * likelihood.log_prob(outcomes) +
@@ -376,7 +391,7 @@ else:
         len(X_train) * 1/user_rescale * (bias_user_prior.log_prob(bias_users) - q_user_bias.log_prob(bias_users) +
                           emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users)) +
         len(X_train) * 1/item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
-                          emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo3')
+                          emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo')
 
 # sentinel0 = tf.reduce_mean(len(X_train) * likelihood.log_prob(outcomes))
 sentinel = {
@@ -420,6 +435,9 @@ infer_op = optimizer.minimize(-elbo)
 
 
 train_elbo = []
+stopped_at = None
+test_rmse_values = []
+test_rmse2_values = []
 with tf.Session() as sess:
     # sess = tf_debug.LocalCLIDebugWrapperSession(sess)
     sess.run(tf.global_variables_initializer())
@@ -432,7 +450,7 @@ with tf.Session() as sess:
         lbs = []
         # c = 0
         dt = time.time()
-        for nb_iter in range(iters):
+        for nb_iter in range(nb_iters):
             dt0 = time.time()
             batch_ids = np.random.randint(0, nb_train_samples, size=batch_size)
             # x_batch, y_batch = sess.run(next_element)
@@ -465,7 +483,12 @@ with tf.Session() as sess:
 
             lbs.append(lb)
             if nb_iter == 0:
-                print(iters, 'times', time.time() - dt0)
+                dt1 = time.time()
+                # print(nb_iters, 'times', dt1 - dt0, '=', nb_iters * (dt1 - dt0))
+                time_per_batch = dt1 - dt0
+        dt1 = time.time()
+        # print('all', 'times', dt1 - dt, 'average', (dt1 - dt) / nb_iters)
+        time_per_epoch1 = dt1 - dt
 
             #except tf.errors.OutOfRangeError:
         # print('train', X_test[0])
@@ -485,7 +508,7 @@ with tf.Session() as sess:
             # print('Pred2', y_train[:5], train_pred2[:5])
 
         if VERBOSE or epoch == epochs or epoch % 10 == 0:
-            test_pred, test_pred2 = sess.run([pred, pred], feed_dict={user_batch: X_test[:, 0],
+            test_pred, test_pred2 = sess.run([pred, pred2], feed_dict={user_batch: X_test[:, 0],
                                                                    item_batch: X_test[:, 1],
                                                                    X_fm_batch: X_test_sp_tf})
                                                                    # X_fm_batch: X_fm_test})
@@ -493,37 +516,60 @@ with tf.Session() as sess:
             print('Test ACC', np.mean(y_test == np.round(test_pred)))
             # print('Test AUC', roc_auc_score(y_test, test_pred))
             # print('Test NLL', log_loss(y_test, test_pred, eps=1e-6))
-            print('Test RMSE', mean_squared_error(y_test, test_pred) ** 0.5)
-            # print('Test2 RMSE', mean_squared_error(y_test, test_pred2) ** 0.5)
+            test_rmse = mean_squared_error(y_test, test_pred) ** 0.5
+            test_rmse2 = mean_squared_error(y_test, test_pred2) ** 0.5
+            print('Test RMSE', test_rmse)
+            print('Test RMSE2', test_rmse2)
+            test_rmse_values.append(test_rmse)
+            test_rmse2_values.append(test_rmse2)
             print('Pred', y_test[:5], test_pred[:5])
             # print('Pred2', y_test[:5], test_pred2[:5])
 
         train_elbo.append(np.mean(lbs))
         print('{:.3f}s Epoch {}: Lower bound = {}'.format(
               time.time() - dt, epoch, np.mean(lbs) / nb_train_samples))
+        time_per_epoch2 = time.time() - dt
         if len(train_elbo) > 5 and sorted(train_elbo[-5:], reverse=True) == train_elbo[-5:]:  # Train lower bound is decreasing
             print('Stop training')
+            stopped_at = epoch
             break
 
-    test_pred, test_pred2 = sess.run([pred, pred], feed_dict={user_batch: X_test[:, 0],
+    test_pred, test_pred2 = sess.run([pred, pred2], feed_dict={user_batch: X_test[:, 0],
                                                                        item_batch: X_test[:, 1],
                                                                        X_fm_batch: X_test_sp_tf})
                                                                        # X_fm_batch: X_fm_test})
 
+
+    test_rmse_values.append(test_rmse)
+    test_rmse2_values.append(test_rmse2)
+
     metrics = {
         'acc': np.mean(y_test == np.round(test_pred)),
-        'rmse': mean_squared_error(y_test, test_pred) ** 0.5
+        'best rmse': min(test_rmse_values),
+        'best rmse2': min(test_rmse2_values),
+        'final rmse': mean_squared_error(y_test, test_pred) ** 0.5,
+        'final rmse2': mean_squared_error(y_test, test_pred2) ** 0.5,
+        'all rmse': test_rmse_values,
+        'all rmse2': test_rmse2_values
     }
     print('Final Test ACC', metrics['acc'])
     # print('Test AUC', roc_auc_score(y_test, test_pred))
     # print('Test NLL', log_loss(y_test, test_pred, eps=1e-6))
-    print('Final Test RMSE', metrics['rmse'])
+    print('Final Test RMSE', metrics['final rmse'])
     # print('Test2 RMSE', mean_squared_error(y_test, test_pred2) ** 0.5)
     print('Final Pred', y_test[:5], test_pred[:5])
 
-filename = '{:s}-{:s}.txt'.format(DATA, datetime.now().isoformat())
+filename = '{:s}-{:d}.txt'.format(DATA, int(round(time.time())))
 with open('results/{:s}'.format(filename), 'w') as f:
     f.write(json.dumps({
+        'description': DESCRIPTION,
+        'date': datetime.now().isoformat(),
+        'time': {
+            'batch': time_per_batch,
+            'epoch': time_per_epoch1,
+            'epoch2': time_per_epoch2
+        },
+        'stopped': stopped_at,
         'args': vars(options),
-        'metrics': metrics
+        'metrics': metrics,
     }, indent=4))
