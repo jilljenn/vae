@@ -44,7 +44,7 @@ print('Data is', DATA)
 VERBOSE = False
 
 # Load data
-if DATA in {'mangaki', 'movie1M', 'movie10M'}:
+if DATA in {'mangaki', 'movie1M', 'movie10M', 'movie100k'}:
     df = pd.read_csv(os.path.join(PATH, 'vae/data', DATA, 'data.csv'))
     try:
         with open(os.path.join(PATH, 'vae/data', DATA, 'config.yml')) as f:
@@ -55,20 +55,6 @@ if DATA in {'mangaki', 'movie1M', 'movie10M'}:
         nb_users = 1 + df['user'].max()
         nb_items = 1 + df['item'].max()
     df['item'] += nb_users
-    print(df.head())
-elif DATA == 'movie100k':
-    with open(os.path.join(PATH, 'vae/data/movie100k/config.yml')) as f:
-        config = yaml.load(f)
-        nb_users = config['nb_users']
-        nb_items = config['nb_items']
-
-    train = pd.read_csv(os.path.join(PATH, 'vae/data/movie100k/movie100k_train.csv'))
-    print(train.shape)
-    test = pd.read_csv(os.path.join(PATH, 'vae/data/movie100k/movie100k_test.csv'))
-    print(test.shape)
-    df = pd.concat((train, test))
-    df['item'] += nb_users  # FM format  # OMG I forgot this
-    print(df.shape)
     print(df.head())
 elif DATA == 'movie':
     with open(os.path.join(PATH, 'vae/data/movie100k/config.yml')) as f:
