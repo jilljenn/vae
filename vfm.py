@@ -2,12 +2,12 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error
 from scipy.sparse import coo_matrix, load_npz, save_npz
 from tensorflow.python import debug as tf_debug
+from collections import Counter, defaultdict
 from datetime import datetime
 import tensorflow as tf
 import tensorflow.distributions as tfd
 import tensorflow_probability as tfp
 wtfd = tfp.distributions
-from collections import Counter
 import argparse
 import os.path
 import getpass
@@ -19,12 +19,14 @@ import time
 import sys
 
 
-DESCRIPTION = 'Not yet global_bias variational approximation, not yet classification'
+DESCRIPTION = 'Not yet global_bias variational approximation'
 
 parser = argparse.ArgumentParser(description='Run VFM')
 parser.add_argument('data', type=str, nargs='?', default='fraction')
 parser.add_argument('--degenerate', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--sparse', type=bool, nargs='?', const=True, default=False)
+parser.add_argument('--regression', type=bool, nargs='?', const=True, default=False)
+parser.add_argument('--classification', type=bool, nargs='?', const=True, default=False)
 
 parser.add_argument('--epochs', type=int, nargs='?', default=500)
 parser.add_argument('--d', type=int, nargs='?', default=20)
@@ -56,14 +58,6 @@ if DATA in {'mangaki', 'movie1M', 'movie10M', 'movie100k'}:
         nb_items = 1 + df['item'].max()
     df['item'] += nb_users
     print(df.head())
-elif DATA == 'movie':
-    with open(os.path.join(PATH, 'vae/data/movie100k/config.yml')) as f:
-        config = yaml.load(f)
-        nb_users = config['nb_users']
-        nb_items = config['nb_items']
-    df = pd.read_csv(os.path.join(PATH, 'vae/data/movie100k/data.csv'))
-    df['item'] += nb_users  # FM format
-    # X = np.array(df)
 else:  # Default is Fraction
     ratings = np.load('fraction.npy')
     print('Fraction data loaded')
@@ -77,6 +71,14 @@ else:  # Default is Fraction
     df = pd.DataFrame(entries, columns=('user', 'item', 'outcome'))
     # X_train = np.array(X_train)
 
+# Is it classification or regression?
+if options.regression or 'rating' in df:
+    is_regression = True
+    is_classification = False
+elif options.classification or 'outcome' in df:
+    is_classification = True
+    is_regression = False
+
 nb_entries = len(df)
 
 # Build sparse features
@@ -84,9 +86,9 @@ rows = np.arange(nb_entries).repeat(2)
 cols = np.array(df[['user', 'item']]).flatten()
 data = np.ones(2 * nb_entries)
 X_fm = coo_matrix((data, (rows, cols)), shape=(nb_entries, nb_users + nb_items)).tocsr()
-try:
+if is_regression:
     y_fm = np.array(df['rating'])
-except:
+else:
     y_fm = np.array(df['outcome']).astype(np.float32)
 save_npz(os.path.join(PATH, 'vae/data', DATA, 'X_fm.npz'), X_fm)
 np.save(os.path.join(PATH, 'vae/data', DATA, 'y_fm.npy'), y_fm)
@@ -110,9 +112,9 @@ print('minimax', np_priors.min(), np_priors.max())
 print(np_priors[nb_users - 5:nb_users + 5])
 
 X_train = np.array(train[['user', 'item']])
-try:
+if is_regression:
     y_train = np.array(train['rating']).astype(np.float32)
-except:
+else:
     y_train = np.array(train['outcome']).astype(np.float32)
 # y_train_bin = np.array(train['outcome'])
 nb_train_samples = len(X_train)
@@ -120,9 +122,9 @@ indices_train = np.column_stack((np.arange(nb_train_samples).repeat(2), X_train.
 X_train_sp_tf = tf.SparseTensorValue(indices_train, np.ones(2 * nb_train_samples), [nb_train_samples, nb_users + nb_items])
 
 X_test = np.array(test[['user', 'item']])
-try:
+if is_regression:
     y_test = np.array(test['rating']).astype(np.float32)
-except:
+else:
     y_test = np.array(test['outcome']).astype(np.float32)
 # y_test_bin = np.array(test['outcome'])
 nb_test_samples = len(X_test)
@@ -313,8 +315,10 @@ def make_sparse_pred_reg(x):
                                   tf.sparse_tensor_dense_matmul(x2, V2), axis=1))
     return tfd.Normal(logits, scale=sigma2)
 
-# likelihood = make_likelihood(feat_users, feat_items, bias_users, bias_items)
-likelihood = make_likelihood_reg(feat_users, feat_items, bias_users, bias_items)
+if is_classification:
+    likelihood = make_likelihood(feat_users, feat_items, bias_users, bias_items)
+else:
+    likelihood = make_likelihood_reg(feat_users, feat_items, bias_users, bias_items)
 sparse_pred = make_sparse_pred_reg(X_fm_batch)
 pred2 = sparse_pred.mean()
 # ll = make_likelihood(feat_users2, feat_items2, bias_users2, bias_items2)
@@ -420,10 +424,24 @@ optimizer = tf.train.AdamOptimizer(gamma)  # 0.001
 infer_op = optimizer.minimize(-elbo)
 
 
+metrics = {
+    'train': defaultdict(list),
+    'valid': defaultdict(list),
+    'test': defaultdict(list)
+}
+
+def save_metrics(category, epoch, y_truth, y_pred):
+    print('[%s] pred' % category, y_truth[:5], y_pred[:5])
+    metrics[category]['epoch'].append(epoch)
+    metrics[category]['acc'].append(np.mean(y_truth == np.round(y_pred)))
+    metrics[category]['rmse'].append(mean_squared_error(y_truth, y_pred) ** 0.5)
+    if is_classification:
+        metrics[category]['auc'].append(roc_auc_score(y_truth, y_pred))
+        metrics[category]['nll'].append(log_loss(y_truth, y_pred, eps=1e-6))
+    print('[%s] ' % category + ' '.join('{:s}={:f}'.format(metric, metrics[category][metric][-1]) for metric in metrics[category]))
+
 train_elbo = []
 stopped_at = None
-test_rmse_values = []
-test_rmse2_values = []
 with tf.Session() as sess:
     # sess = tf_debug.LocalCLIDebugWrapperSession(sess)
     sess.run(tf.global_variables_initializer())
@@ -455,14 +473,12 @@ with tf.Session() as sess:
                                                           item_batch: X_batch[:, 1],
                                                           outcomes: y_train[batch_ids],
                                                           X_fm_batch: tf.SparseTensorValue(indices, np.ones(2 * batch_size), [batch_size, nb_users + nb_items])})
-                                                          #X_fm_batch: X_fm_train[batch_ids]})
 
             if VERBOSE:
                 values = sess.run([sentinel[key] for key in sentinel], feed_dict={user_batch: X_batch[:, 0],
                                                               item_batch: X_batch[:, 1],
                                                               outcomes: y_train[batch_ids],
                                                               X_fm_batch: tf.SparseTensorValue(indices, np.ones(2 * batch_size), [batch_size, nb_users + nb_items])})
-                                                              #X_fm_batch: X_fm_train[batch_ids]})
 
                 for key, val in zip(sentinel, values):
                     print(key, val)
@@ -480,18 +496,11 @@ with tf.Session() as sess:
         # print('train', X_test[0])
         # print('train fm', X_fm_test[0])
         if VERBOSE:
-            train_pred, train_pred2 = sess.run([pred, pred], feed_dict={user_batch: X_train[:, 0],
+            train_pred, train_pred2 = sess.run([pred, pred2], feed_dict={user_batch: X_train[:, 0],
                                                                      item_batch: X_train[:, 1],
                                                                      X_fm_batch: X_train_sp_tf})
-                                                                     # X_fm_batch: X_fm_train})
-        
-            print('Train ACC', np.mean(y_train == np.round(train_pred)))
-            #print('Train AUC', roc_auc_score(y_train, train_pred))
-            #print('Train NLL', log_loss(y_train, train_pred, eps=1e-6))
-            print('Train RMSE', mean_squared_error(y_train, train_pred) ** 0.5)
-            # print('Train2 RMSE', mean_squared_error(y_train, train_pred2) ** 0.5)
-            print('Pred', y_train[:5], train_pred[:5])
-            # print('Pred2', y_train[:5], train_pred2[:5])
+            save_metrics('train', epoch, y_train, train_pred)
+            
 
         if VERBOSE or epoch == epochs or epoch % 10 == 0:
             test_pred, test_pred2 = sess.run([pred, pred2], feed_dict={user_batch: X_test[:, 0],
@@ -499,17 +508,7 @@ with tf.Session() as sess:
                                                                    X_fm_batch: X_test_sp_tf})
                                                                    # X_fm_batch: X_fm_test})
 
-            print('Test ACC', np.mean(y_test == np.round(test_pred)))
-            # print('Test AUC', roc_auc_score(y_test, test_pred))
-            # print('Test NLL', log_loss(y_test, test_pred, eps=1e-6))
-            test_rmse = mean_squared_error(y_test, test_pred) ** 0.5
-            test_rmse2 = mean_squared_error(y_test, test_pred2) ** 0.5
-            print('Test RMSE', test_rmse)
-            print('Test RMSE2', test_rmse2)
-            test_rmse_values.append(test_rmse)
-            test_rmse2_values.append(test_rmse2)
-            print('Pred', y_test[:5], test_pred[:5])
-            # print('Pred2', y_test[:5], test_pred2[:5])
+            save_metrics('test', epoch, y_test, test_pred)
 
         train_elbo.append(np.mean(lbs))
         print('{:.3f}s Epoch {}: Lower bound = {}'.format(
@@ -526,24 +525,12 @@ with tf.Session() as sess:
                                                                        # X_fm_batch: X_fm_test})
 
 
-    test_rmse_values.append(test_rmse)
-    test_rmse2_values.append(test_rmse2)
-
-    metrics = {
-        'acc': np.mean(y_test == np.round(test_pred)),
-        'best rmse': min(test_rmse_values),
-        'best rmse2': min(test_rmse2_values),
-        'final rmse': mean_squared_error(y_test, test_pred) ** 0.5,
-        'final rmse2': mean_squared_error(y_test, test_pred2) ** 0.5,
-        'all rmse': test_rmse_values,
-        'all rmse2': test_rmse2_values
-    }
-    print('Final Test ACC', metrics['acc'])
-    # print('Test AUC', roc_auc_score(y_test, test_pred))
-    # print('Test NLL', log_loss(y_test, test_pred, eps=1e-6))
-    print('Final Test RMSE', metrics['final rmse'])
-    # print('Test2 RMSE', mean_squared_error(y_test, test_pred2) ** 0.5)
-    print('Final Pred', y_test[:5], test_pred[:5])
+    for metric in metrics['test']:
+        final = metrics['test'][metric][-1]
+        best = (np.max if metric in {'auc', 'acc'} else np.min)(metrics['test'][metric])
+        metrics['final ' + metric] = final
+        metrics['best ' + metric] = best
+        print('[{:s}] final={:f} best={:f}'.format(metric, final, best))
 
 filename = '{:s}-{:d}.txt'.format(DATA, int(round(time.time())))
 with open('results/{:s}'.format(filename), 'w') as f:
