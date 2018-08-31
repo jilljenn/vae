@@ -34,3 +34,7 @@ wow = tf.SparseTensorValue(np.column_stack((rows, cols)), X.shape, data)
 #print(tf.constant(wow))
 print(wow)
 print(wow[0])
+
+# print(prior.cdf(1.7))
+# for _ in range(3):
+#     print(prior.sample([2]))
