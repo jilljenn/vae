@@ -19,7 +19,7 @@ import time
 import sys
 
 
-DESCRIPTION = 'Not yet global_bias variational approximation'
+DESCRIPTION = 'Silent mode, not yet global_bias variational approximation'
 start_time = time.time()
 
 parser = argparse.ArgumentParser(description='Run VFM')
@@ -29,7 +29,7 @@ parser.add_argument('--sparse', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--regression', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--classification', type=bool, nargs='?', const=True, default=False)
 
-parser.add_argument('--patience', type=int, nargs='?', default=10)
+parser.add_argument('--patience', type=int, nargs='?', default=4)
 parser.add_argument('--d', type=int, nargs='?', default=20)
 parser.add_argument('--gamma', type=float, nargs='?', default=0.01)
 parser.add_argument('--nb_batches', type=int, nargs='?', default=1)
@@ -43,7 +43,7 @@ else:
 
 DATA = options.data
 print('Data is', DATA)
-VERBOSE = False
+VERBOSE = 0
 
 # Load data
 if DATA in {'fraction', 'mangaki', 'movie1M', 'movie10M', 'movie100k'}:
@@ -118,7 +118,7 @@ for category in data:
     X_sp[category] = tf.SparseTensorValue(indices, np.ones(2 * nb_samples[category]), [nb_samples[category], nb_users + nb_items])
 
 # Config
-MAX_EPOCHS = 5000
+MAX_EPOCHS = 500
 print('Nb samples', nb_samples['train'])
 embedding_size = options.d
 nb_iters = options.nb_batches
@@ -400,7 +400,13 @@ class VFM:
         print('START', self.model_name())
 
     def model_name(self):
-        return '{:s}-{:s}-{:.1f}'.format(DATA, self.data['train'], self.sigma2)
+        if options.degenerate:
+            title = 'fm-map'
+        elif options.sparse:
+            title = 'vfm-sparse'
+        else:
+            title = 'vfm'
+        return '{:s}-{:s}-{:s}-{:.2f}'.format(DATA, title, self.data['train'], self.sigma2)
 
     def stopping_rule(self):
         last_values = self.metrics[self.category_watcher][self.metric_watcher][-self.patience:]
@@ -408,7 +414,7 @@ class VFM:
         return (self.epoch >= MAX_EPOCHS or (len(last_values) >= self.patience and last_values == sorted(last_values, reverse=is_decreasing))), last_values
 
     def save_metrics(self, category, epoch, y_truth, y_pred):
-        if category is not 'valid':
+        if VERBOSE:
             print('[%s] pred' % category, y_truth[:5], y_pred[:5])
         self.metrics[category]['epoch'].append(epoch)
         self.metrics[category]['acc'].append(np.mean(y_truth == np.round(y_pred)))
@@ -416,7 +422,7 @@ class VFM:
         if set(y_truth) == {0., 1.}:
             self.metrics[category]['auc'].append(roc_auc_score(y_truth, y_pred))
             self.metrics[category]['nll'].append(log_loss(y_truth, y_pred, eps=1e-6))
-        if category is not 'valid':
+        if VERBOSE:
             print('[%s] ' % category + ' '.join('{:s}={:f}'.format(metric, self.metrics[category][metric][-1]) for metric in self.metrics[category]))
 
     def run_and_save(self, category):
@@ -428,12 +434,14 @@ class VFM:
 
     def save_logs(self):
         filename = '{:s}-{:d}.txt'.format(self.model_name(), int(round(time.time())))
+        self.metrics['sigma2'] = self.sigma2
+        self.metrics['model_name'] = self.model_name()
         self.metrics['time']['total'] = time.time() - self.start_time
         with open('results/{:s}'.format(filename), 'w') as f:
             f.write(json.dumps({
                 'description': DESCRIPTION,
                 'date': datetime.now().isoformat(),
-                'stopped': self.epoch,
+                'stopped': '{:d}/{:d}'.format(self.epoch, MAX_EPOCHS),
                 'args': vars(options),
                 'metrics': self.metrics,
             }, indent=4))
@@ -461,7 +469,7 @@ class VFM:
 
                 _, train_elbo = sess.run([infer_op, elbo], feed_dict=make_feed('batch'))
 
-                if VERBOSE:
+                if VERBOSE >= 100:
                     values = sess.run([sentinel[key] for key in sentinel], feed_dict=make_feed('batch'))
                     for key, val in zip(sentinel, values):
                         print(key, val)
@@ -472,19 +480,20 @@ class VFM:
             if self.epoch == 1:
                 self.metrics['time']['per_epoch'] = time.time() - dt
 
-            if self.data['valid'] == 'valid':
+            if self.data['valid'] == 'valid' and self.epoch % 10 == 0:
                 self.run_and_save('valid')
             has_to_stop, watched_values = self.stopping_rule()
 
             self.metrics['train']['epoch'].append(self.epoch)
             self.metrics['train']['elbo'].append(np.mean(train_elbos) / nb_samples[self.data['train']])
-            if VERBOSE:
+            if VERBOSE >= 10:
                 self.run_and_save('train')
                 
-            if VERBOSE or self.epoch % 10 == 0 or has_to_stop:
+            if VERBOSE or self.epoch % 5000 == 0 or has_to_stop:
                 self.run_and_save('test')
 
-            print('{:.3f}s Epoch {}: Lower bound = {}'.format(time.time() - dt, self.epoch, self.metrics['train']['elbo'][-1]))
+            if VERBOSE:
+                print('{:.3f}s [{}] Epoch {}: Lower bound = {}'.format(time.time() - dt, self.model_name(), self.epoch, self.metrics['train']['elbo'][-1]))
 
             if has_to_stop:
                 break
@@ -519,7 +528,8 @@ with tf.Session() as sess:
             vfm = VFM('train', 'valid', sigma2, stop_when_worse=('valid', 'auc' if is_classification else 'rmse'))
             valid_metric = vfm.train()
             valid_metrics.append(valid_metric)
-        best_sigma = sigma2s[np.argmax(valid_metrics)]
+        print('Candidates', dict(zip(sigma2s, valid_metrics)))
+        best_sigma = sigma2s[np.argmin(valid_metrics)]
 
     refit = VFM('trainval', 'trainval', best_sigma, stop_when_worse=('train', 'elbo'))
     refit.train()
