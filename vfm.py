@@ -19,7 +19,7 @@ import time
 import sys
 
 
-DESCRIPTION = 'Silent mode, not yet global_bias variational approximation'
+DESCRIPTION = 'Sparse mode, not yet global_bias variational approximation'
 start_time = time.time()
 
 parser = argparse.ArgumentParser(description='Run VFM')
@@ -34,8 +34,7 @@ parser.add_argument('--d', type=int, nargs='?', default=20)
 parser.add_argument('--gamma', type=float, nargs='?', default=0.01)
 parser.add_argument('--nb_batches', type=int, nargs='?', default=1)
 options = parser.parse_args()
-
-
+ 
 if getpass.getuser() == 'jj':
     PATH = '/home/jj'
 else:
@@ -43,11 +42,13 @@ else:
 
 DATA = options.data
 print('Data is', DATA)
-VERBOSE = 5
+VERBOSE = 0
+NB_SAMPLES = 1
 
 # Load data
 if DATA in {'fraction', 'mangaki', 'movie1M', 'movie10M', 'movie100k'}:
     df = pd.read_csv(os.path.join(PATH, 'vae/data', DATA, 'data.csv'))
+    print('Starts at', df['user'].min(), df['item'].min())
     try:
         with open(os.path.join(PATH, 'vae/data', DATA, 'config.yml')) as f:
             config = yaml.load(f)
@@ -80,9 +81,10 @@ if not os.path.isfile(X_fm_file):
     data = np.ones(2 * nb_entries)
     X_fm = coo_matrix((data, (rows, cols)), shape=(nb_entries, nb_users + nb_items)).tocsr()
 
-    q = load_npz(X_fm_file.replace('X_fm', 'q'))
-    _, nb_skills = q.shape
-    X_fm = hstack((X_fm, q[df['item'] - nb_users])).tocsr()
+    q_file = X_fm_file.replace('X_fm', 'q')
+    if os.path.isfile(q_file):
+        q = load_npz(q_file)
+        X_fm = hstack((X_fm, q[df['item'] - nb_users])).tocsr()
 
     if is_regression:
         y_fm = np.array(df['rating'])
@@ -94,7 +96,6 @@ else:
     X_fm = load_npz(X_fm_file)
 
 nb_skills = X_fm.shape[1] - nb_users - nb_items
-print('ouf', X_fm.shape)
 
 i = {}
 i['trainval'], i['test'] = train_test_split(list(range(nb_entries)), test_size=0.2)
@@ -124,7 +125,6 @@ for category in data:
     else:
         y[category] = np.array(data[category]['outcome']).astype(np.float32)
     nb_samples[category] = len(X[category])
-    # indices = np.column_stack((np.arange(nb_samples[category]).repeat(2), X[category].flatten()))
     X_sp[category] = make_sparse_tf(X_fm[i[category]])
 
 # Config
@@ -215,11 +215,8 @@ q_user_bias = make_entity_bias(user_batch)
 q_item_bias = make_entity_bias(item_batch)
 q_entity = make_user_posterior(all_entities)
 q_entity_bias = make_entity_bias(all_entities)
-all_bias = q_entity_bias.sample(10)
-all_feat = q_entity.sample(10)
-
-print('all bias', all_bias)
-print('all feat', all_feat)
+all_bias = q_entity_bias.sample(NB_SAMPLES)
+all_feat = q_entity.sample(NB_SAMPLES)
 
 # feat_users2 = tf.nn.embedding_lookup(all_feat, user_batch)
 # feat_items2 = tf.nn.embedding_lookup(all_feat, item_batch)
@@ -253,9 +250,6 @@ def make_sparse_pred(x):
     w = tf.reshape(this_bias, (-1, 1))
     V = this_feat
     V2 = V ** 2
-    print('x', x)
-    print('V', V)
-    print('xV', tf.sparse_tensor_dense_matmul(x, V))
     logits = (tf.squeeze(tf.sparse_tensor_dense_matmul(x, w)) +
               0.5 * tf.reduce_sum(tf.sparse_tensor_dense_matmul(x, V) ** 2 -
                                   tf.sparse_tensor_dense_matmul(x2, V2), axis=1))
@@ -271,9 +265,6 @@ def make_sparse_pred_reg(sigma2, x):
     # V = users[:, embedding_size:]
     V = this_feat
     V2 = V ** 2
-    print('x', x)
-    print('V', V)
-    print('xV', tf.sparse_tensor_dense_matmul(x, V))
     logits = (tf.squeeze(tf.sparse_tensor_dense_matmul(x, w)) +
               0.5 * tf.reduce_sum(tf.sparse_tensor_dense_matmul(x, V) ** 2 -
                                   tf.sparse_tensor_dense_matmul(x2, V2), axis=1))
@@ -297,7 +288,7 @@ def define_variables(train_category, priors, sigma2):
 
     user_rescale = tf.nn.embedding_lookup(priors, user_batch)[:, 0]
     item_rescale = tf.nn.embedding_lookup(priors, item_batch)[:, 0]
-    entity_rescale = priors[:, 0]
+    entity_rescale = 1 + priors[:, 0]
 
     if is_classification:
         likelihood = make_likelihood(feat_users, feat_items, bias_users, bias_items)
@@ -343,39 +334,15 @@ def define_variables(train_category, priors, sigma2):
     # / 2 : 1.27
     # * 2 : 1.16
     elif options.sparse:
-        print('bias', bias_entity_prior.log_prob(all_bias))
-        print('bias', q_entity_bias.log_prob(all_bias))
-        print('emb', emb_entity_prior.log_prob(all_feat))
-        print('emb', q_entity.log_prob(all_feat))
-
-        # A = tf.sign(X_fm_batch)
-        # print(A)
-        # B = 1 / entity_rescale * (bias_entity_prior.log_prob(all_bias) - q_entity_bias.log_prob(all_bias) + emb_entity_prior.log_prob(all_feat) - q_entity.log_prob(all_feat))
-        # print(B)
-        # print('will work?', tf.sparse_tensor_dense_matmul(A, B))
-
-        print('X_fm ->', X_fm_batch.get_shape())
-        print('X_fm ->', tf.sign(X_fm_batch).get_shape())
-        print('rescale', entity_rescale)
-        print('u + i', nb_users + nb_items)
-
         nb_occ = tf.sparse_reshape(tf.sparse_reduce_sum_sparse(X_fm_batch, axis=0), (1, -1))
-        print('sum X_fm ->', nb_occ.get_shape())
 
         lp_lq = tf.reduce_sum(bias_entity_prior.log_prob(all_bias) - q_entity_bias.log_prob(all_bias) +
                               emb_entity_prior.log_prob(all_feat) - q_entity.log_prob(all_feat), axis=0)
         scaled_lp_lq = tf.reshape(1 / entity_rescale * lp_lq, (-1, 1))
         relevant_scaled_lp_lq = tf.squeeze(tf.sparse_tensor_dense_matmul(nb_occ, scaled_lp_lq))
 
-        print('relevant', relevant_scaled_lp_lq)
-        print('relevant', relevant_scaled_lp_lq.shape)
-
-        elbo = (nb_samples[train_category] * tf.reduce_mean(likelihood.log_prob(outcomes)) + #tf.reduce_mean(sparse_pred.log_prob(outcomes)) +
-                relevant_scaled_lp_lq)
-        # elbo = (nb_samples[train_category] * tf.reduce_mean(sparse_pred.log_prob(outcomes)) +
-        #         tf.reduce_sum(bias_entity_prior.log_prob(all_bias) - q_entity_bias.log_prob(all_bias) +
-        #                       emb_entity_prior.log_prob(all_feat) - q_entity.log_prob(all_feat)))
-
+        elbo = (tf.reduce_mean(sparse_pred.log_prob(outcomes)) +
+                relevant_scaled_lp_lq / nb_samples[train_category])
 
     else:
         # elbo = tf.reduce_mean(
@@ -393,25 +360,38 @@ def define_variables(train_category, priors, sigma2):
         #     nb_samples[train_category] * 1 / item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
         #                       emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo')
 
-        elbo = (1 / nb_samples[train_category] * tf.reduce_mean(
-            nb_samples[train_category] * likelihood.log_prob(outcomes)) +
+        elbo = (1 / nb_samples[train_category] * (tf.reduce_mean(nb_samples[train_category] * likelihood.log_prob(outcomes)) +
             tf.reduce_sum(1 / user_rescale * (bias_user_prior.log_prob(bias_users) - q_user_bias.log_prob(bias_users) +
                               emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users)) +
                           1 / item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
-                              emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items))))
+                              emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)))))
 
     sentinel = {
         'nb outcomes': tf.shape(outcomes),
         'nb samples': tf.constant(nb_samples[train_category]),
         'users': entity[:5, 0],
-        # 'SNIRFL': tf.shape(relevant_scaled_lp_lq)
+        # 'lplq': relevant_scaled_lp_lq,
         # 'll log prob': -likelihood.log_prob(outcomes),
         # 'll log prob sparse': -sparse_pred.log_prob(outcomes),
+        'll log prob has nan': tf.reduce_any(tf.is_nan(likelihood.log_prob(outcomes))),
+        'll log prob sparse has nan': tf.reduce_any(tf.is_nan(sparse_pred.log_prob(outcomes))),
         # 's ll log prob': -tf.reduce_sum(likelihood.log_prob(outcomes)),
         # 's pred delta': tf.reduce_sum((pred - outcomes) ** 2 / 2 + np.log(2 * np.pi) / 2),
+        # 'logits': logits,
+        # 'max logits': tf.reduce_max(logits),
+        # 'min logits': tf.reduce_min(logits),
+        # 'max logits2': tf.reduce_max(logits2),
+        # 'min logits2': tf.reduce_min(logits2),
         # 'bias sample': bias_users[0],
         # 'bias log prob': -bias_user_prior.log_prob(bias_users)[0],
         # 'sum bias log prob': -tf.reduce_sum(bias_user_prior.log_prob(bias_users)),
+        'pred': pred,
+        'pred2': pred2,
+        'max pred': tf.reduce_max(pred),
+        'min pred': tf.reduce_min(pred),
+        'max pred2': tf.reduce_max(pred2),
+        'min pred2': tf.reduce_min(pred2),
+        'has nan': tf.reduce_any(tf.is_nan(pred2))
         # 'bias mean': bias_user_prior.mean(),
         # 'bias delta': bias_users[0] ** 2 / 2 + np.log(2 * np.pi) / 2,
         # 'sum bias delta': tf.reduce_sum(bias_users ** 2 / 2 + np.log(2 * np.pi) / 2)
@@ -495,15 +475,13 @@ class VFM:
 
     def run_and_save(self, category):
         valid_pred = sess.run(self.pred, feed_dict=make_feed(self.data[category]))
-        # if category == 'valid' and self.data['valid'] != 'valid':
-        #     print(np.isnan(valid_pred).any())
-        #     print(valid_pred)
         self.save_metrics(category, self.epoch, y[self.data[category]], valid_pred)
 
     def save_logs(self):
         filename = '{:s}-{:d}.txt'.format(self.model_name(), int(round(time.time())))
         self.metrics['sigma2'] = self.sigma2
         self.metrics['model_name'] = self.model_name()
+        # self.metrics['train']['elbo'] = self.metrics['train']['elbo'].astype()
         self.metrics['time']['total'] = time.time() - self.start_time
         with open('results/{:s}'.format(filename), 'w') as f:
             f.write(json.dumps({
@@ -532,8 +510,7 @@ class VFM:
                 batch_ids = np.random.randint(0, nb_samples[self.data['train']], size=self.batch_size)
                 X['batch'] = X[self.data['train']][batch_ids]
                 y['batch'] = y[self.data['train']][batch_ids]
-                # indices = np.column_stack((np.arange(batch_size).repeat(2), X['batch'].flatten()))
-                X_sp['batch'] = make_sparse_tf(X_fm[batch_ids])#tf.SparseTensorValue(indices, np.ones(2 * batch_size), [batch_size, nb_users + nb_items])
+                X_sp['batch'] = make_sparse_tf(X_fm[i[self.data['train']]][batch_ids])
 
                 _, train_elbo = sess.run([infer_op, elbo], feed_dict=make_feed('batch'))
 
@@ -553,11 +530,11 @@ class VFM:
             has_to_stop, watched_values = self.stopping_rule()
 
             self.metrics['train']['epoch'].append(self.epoch)
-            self.metrics['train']['elbo'].append(np.mean(train_elbos))
+            self.metrics['train']['elbo'].append(np.mean(train_elbos).astype(np.float64))
             if VERBOSE >= 10:
                 self.run_and_save('train')
                 
-            if VERBOSE >= 5 or self.epoch % 5000 == 0 or has_to_stop:
+            if VERBOSE >= 5 or self.epoch % 10 == 0 or has_to_stop:
                 self.run_and_save('test')
 
             if VERBOSE:
@@ -590,7 +567,7 @@ with tf.Session() as sess:
     if is_classification:
         best_sigma = 0.
     else:  # Have to find sigma2 via cross validation
-        sigma2s = [0.01, 0.1, 0.2, 0.5, 1.]
+        sigma2s = [0.1, 0.2, 0.5, 1.]
         valid_metrics = []
         for sigma2 in sigma2s:
             vfm = VFM('train', 'valid', sigma2, stop_when_worse=('valid', 'auc' if is_classification else 'rmse'))
