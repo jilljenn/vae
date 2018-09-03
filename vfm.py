@@ -1,6 +1,6 @@
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error
-from scipy.sparse import coo_matrix, load_npz, save_npz
+from scipy.sparse import coo_matrix, load_npz, save_npz, hstack, find
 from tensorflow.python import debug as tf_debug
 from collections import Counter, defaultdict
 from datetime import datetime
@@ -43,7 +43,7 @@ else:
 
 DATA = options.data
 print('Data is', DATA)
-VERBOSE = 0
+VERBOSE = 5
 
 # Load data
 if DATA in {'fraction', 'mangaki', 'movie1M', 'movie10M', 'movie100k'}:
@@ -79,6 +79,11 @@ if not os.path.isfile(X_fm_file):
     cols = np.array(df[['user', 'item']]).flatten()
     data = np.ones(2 * nb_entries)
     X_fm = coo_matrix((data, (rows, cols)), shape=(nb_entries, nb_users + nb_items)).tocsr()
+
+    q = load_npz(X_fm_file.replace('X_fm', 'q'))
+    _, nb_skills = q.shape
+    X_fm = hstack((X_fm, q[df['item'] - nb_users])).tocsr()
+
     if is_regression:
         y_fm = np.array(df['rating'])
     else:
@@ -88,23 +93,28 @@ if not os.path.isfile(X_fm_file):
 else:
     X_fm = load_npz(X_fm_file)
 
-i_trainval, i_test = train_test_split(list(range(nb_entries)), test_size=0.2)
-i_train, i_valid = train_test_split(i_trainval, test_size=0.2)
-data = {
-    'train': df.iloc[i_train],
-    'valid': df.iloc[i_valid],
-    'trainval': df.iloc[i_trainval],
-    'test': df.iloc[i_test]
-}
+nb_skills = X_fm.shape[1] - nb_users - nb_items
+print('ouf', X_fm.shape)
+
+i = {}
+i['trainval'], i['test'] = train_test_split(list(range(nb_entries)), test_size=0.2)
+i['train'], i['valid'] = train_test_split(i['trainval'], test_size=0.2)
+data = {key: df.iloc[i[key]] for key in {'train', 'valid', 'trainval', 'test'}}
 
 X = {}
 X_sp = {}
 y = {}
 nb_samples = {}
 nb_occurrences = {
-    'train': X_fm[i_train].sum(axis=0).A1,
-    'trainval': X_fm[i_trainval].sum(axis=0).A1
+    'train': X_fm[i['train']].sum(axis=0).A1,
+    'trainval': X_fm[i['trainval']].sum(axis=0).A1
 }
+
+def make_sparse_tf(X_fm):
+    nb_rows, _ = X_fm.shape
+    rows, cols, data = find(X_fm)
+    indices = list(zip(rows, cols))
+    return tf.SparseTensorValue(indices, data, [nb_rows, nb_users + nb_items + nb_skills])
 
 for category in data:
     X[category] = np.array(data[category][['user', 'item']])
@@ -114,24 +124,23 @@ for category in data:
     else:
         y[category] = np.array(data[category]['outcome']).astype(np.float32)
     nb_samples[category] = len(X[category])
-    indices = np.column_stack((np.arange(nb_samples[category]).repeat(2), X[category].flatten()))
-    X_sp[category] = tf.SparseTensorValue(indices, np.ones(2 * nb_samples[category]), [nb_samples[category], nb_users + nb_items])
+    # indices = np.column_stack((np.arange(nb_samples[category]).repeat(2), X[category].flatten()))
+    X_sp[category] = make_sparse_tf(X_fm[i[category]])
 
 # Config
 MAX_EPOCHS = 500
 print('Nb samples', nb_samples['train'])
 embedding_size = options.d
 nb_iters = options.nb_batches
-batch_size = nb_samples['train'] // nb_iters  # All
 print('Nb iters', nb_iters)
 gamma = options.gamma  # gamma 0.001 works better for classification
 
 dt = time.time()
 
 global_bias = tf.get_variable('global_bias', shape=[], initializer=tf.truncated_normal_initializer(stddev=0.1))
-users = tf.get_variable('entities', shape=[nb_users + nb_items, 2 * embedding_size], initializer=tf.truncated_normal_initializer(stddev=0.1))
-bias = tf.get_variable('bias', shape=[nb_users + nb_items, 2], initializer=tf.truncated_normal_initializer(stddev=0.1))
-all_entities = tf.constant(np.arange(nb_users + nb_items))
+entity = tf.get_variable('entities', shape=[nb_users + nb_items + nb_skills, 2 * embedding_size], initializer=tf.truncated_normal_initializer(stddev=0.1))
+bias = tf.get_variable('bias', shape=[nb_users + nb_items + nb_skills, 2], initializer=tf.truncated_normal_initializer(stddev=0.1))
+all_entities = tf.constant(np.arange(nb_users + nb_items + nb_skills))
 
 def make_mu():
     return tfd.Normal(loc=0., scale=1.)
@@ -162,7 +171,7 @@ def make_bias_prior3(priors, entity_batch):
     return tfd.Normal(loc=0., scale=1/tf.sqrt(prior_prec_entity[:, 0]), name='strong_bias_prior')
 
 def make_user_posterior(user_batch):
-    feat_users = tf.nn.embedding_lookup(users, user_batch)
+    feat_users = tf.nn.embedding_lookup(entity, user_batch)
     # return tfd.Normal(loc=feat_users[:, :embedding_size], scale=feat_users[:, embedding_size:])
     if options.degenerate:
         std_devs = tf.zeros(embedding_size)
@@ -189,7 +198,7 @@ def make_entity_bias(entity_batch):
 
 user_batch = tf.placeholder(tf.int32, shape=[None], name='user_batch')
 item_batch = tf.placeholder(tf.int32, shape=[None], name='item_batch')
-X_fm_batch = tf.sparse_placeholder(tf.int32, shape=[None, nb_users + nb_items], name='sparse_batch')
+X_fm_batch = tf.sparse_placeholder(tf.float32, shape=[None, nb_users + nb_items + nb_skills], name='sparse_batch')
 outcomes = tf.placeholder(tf.float32, shape=[None], name='outcomes')
 
 # mu0 = make_mu().sample()
@@ -204,11 +213,14 @@ q_user = make_user_posterior(user_batch)
 q_item = make_user_posterior(item_batch)
 q_user_bias = make_entity_bias(user_batch)
 q_item_bias = make_entity_bias(item_batch)
-
 q_entity = make_user_posterior(all_entities)
 q_entity_bias = make_entity_bias(all_entities)
-all_bias = q_entity_bias.sample()
-all_feat = q_entity.sample()
+all_bias = q_entity_bias.sample(10)
+all_feat = q_entity.sample(10)
+
+print('all bias', all_bias)
+print('all feat', all_feat)
+
 # feat_users2 = tf.nn.embedding_lookup(all_feat, user_batch)
 # feat_items2 = tf.nn.embedding_lookup(all_feat, item_batch)
 # bias_users2 = tf.nn.embedding_lookup(all_bias, user_batch)
@@ -234,24 +246,34 @@ def make_likelihood_reg(sigma2, feat_users, feat_items, bias_users, bias_items):
     return tfd.Normal(logits, scale=sigma2, name='pred')
 
 def make_sparse_pred(x):
-    x = tf.cast(x, tf.float32)
-    x2 = x ** 2
-    w = tf.reshape(bias[:, 0], (-1, 1))  # Otherwise tf.matmul is crying
-    V = users[:, embedding_size:]
+    #x = tf.cast(x, tf.float32)
+    x2 = x# ** 2  # FIXME if x is 0/1 it's okay
+    this_bias = tf.reduce_sum(all_bias, axis=0)
+    this_feat = tf.reduce_sum(all_feat, axis=0)
+    w = tf.reshape(this_bias, (-1, 1))
+    V = this_feat
     V2 = V ** 2
-    logits = (tf.squeeze(tf.matmul(x, w, a_is_sparse=True)) +
-              0.5 * tf.reduce_sum(tf.matmul(x, V, a_is_sparse=True) ** 2 -
-                                  tf.matmul(x2, V2, a_is_sparse=True), axis=1))
+    print('x', x)
+    print('V', V)
+    print('xV', tf.sparse_tensor_dense_matmul(x, V))
+    logits = (tf.squeeze(tf.sparse_tensor_dense_matmul(x, w)) +
+              0.5 * tf.reduce_sum(tf.sparse_tensor_dense_matmul(x, V) ** 2 -
+                                  tf.sparse_tensor_dense_matmul(x2, V2), axis=1))
     return tfd.Bernoulli(logits)
 
 def make_sparse_pred_reg(sigma2, x):
-    x = tf.cast(x, tf.float32)
+    #x = tf.cast(x, tf.float32)
     x2 = x# ** 2  # FIXME if x is 0/1 it's okay
-    w = tf.reshape(all_bias, (-1, 1))
+    this_bias = tf.reduce_sum(all_bias, axis=0)
+    this_feat = tf.reduce_sum(all_feat, axis=0)
+    w = tf.reshape(this_bias, (-1, 1))
     # w = tf.reshape(bias[:, 0], (-1, 1))  # Otherwise tf.matmul is crying
     # V = users[:, embedding_size:]
-    V = all_feat
+    V = this_feat
     V2 = V ** 2
+    print('x', x)
+    print('V', V)
+    print('xV', tf.sparse_tensor_dense_matmul(x, V))
     logits = (tf.squeeze(tf.sparse_tensor_dense_matmul(x, w)) +
               0.5 * tf.reduce_sum(tf.sparse_tensor_dense_matmul(x, V) ** 2 -
                                   tf.sparse_tensor_dense_matmul(x2, V2), axis=1))
@@ -261,22 +283,28 @@ def define_variables(train_category, priors, sigma2):
     if options.degenerate:
         emb_user_prior = make_embedding_prior()
         emb_item_prior = make_embedding_prior()
+        emb_entity_prior = make_embedding_prior()
         bias_user_prior = make_bias_prior()
         bias_item_prior = make_bias_prior()
+        bias_entity_prior = make_bias_prior()
     else:
         emb_user_prior = make_embedding_prior3(priors, user_batch)
         emb_item_prior = make_embedding_prior3(priors, item_batch)
+        emb_entity_prior = make_embedding_prior3(priors, all_entities)
         bias_user_prior = make_bias_prior3(priors, user_batch)
         bias_item_prior = make_bias_prior3(priors, item_batch)
+        bias_entity_prior = make_bias_prior3(priors, all_entities)
 
     user_rescale = tf.nn.embedding_lookup(priors, user_batch)[:, 0]
     item_rescale = tf.nn.embedding_lookup(priors, item_batch)[:, 0]
+    entity_rescale = priors[:, 0]
 
     if is_classification:
         likelihood = make_likelihood(feat_users, feat_items, bias_users, bias_items)
+        sparse_pred = make_sparse_pred(X_fm_batch)
     else:
         likelihood = make_likelihood_reg(sigma2, feat_users, feat_items, bias_users, bias_items)
-    sparse_pred = make_sparse_pred_reg(sigma2, X_fm_batch)
+        sparse_pred = make_sparse_pred_reg(sigma2, X_fm_batch)
     pred2 = sparse_pred.mean()
     # ll = make_likelihood(feat_users2, feat_items2, bias_users2, bias_items2)
     pred = likelihood.mean()
@@ -308,22 +336,47 @@ def define_variables(train_category, priors, sigma2):
         #          0.1 * tf.reduce_sum(tf.nn.l2_loss(bias_users) + tf.nn.l2_loss(bias_items) +
         #          tf.nn.l2_loss(feat_users) + tf.nn.l2_loss(feat_items)))
         elbo = tf.reduce_mean(
-            nb_samples[train_category] * likelihood.log_prob(outcomes) +
+            likelihood.log_prob(outcomes) +
             # nb_samples['train'] * sparse_pred.log_prob(outcomes) +
-            (nb_users + nb_items) * 2 * (bias_user_prior.log_prob(bias_users) +
-                                         emb_user_prior.log_prob(feat_users) +
-                                         bias_item_prior.log_prob(bias_items) +
-                                         emb_user_prior.log_prob(feat_items)), name='elbo')
+            1 / user_rescale * (bias_user_prior.log_prob(bias_users) + emb_user_prior.log_prob(feat_users)) +
+            1 / item_rescale * (bias_item_prior.log_prob(bias_items) + emb_user_prior.log_prob(feat_items)), name='elbo')
     # / 2 : 1.27
     # * 2 : 1.16
     elif options.sparse:
-        elbo = tf.reduce_mean(
-            # nb_samples['train'] * likelihood.log_prob(outcomes) +
-            nb_samples[train_category] * sparse_pred.log_prob(outcomes) +
-            nb_samples[train_category] * 1/user_rescale * (bias_user_prior.log_prob(bias_users) - q_user_bias.log_prob(bias_users) +
-                              emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users)) +
-            nb_samples[train_category] * 1/item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
-                              emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo')
+        print('bias', bias_entity_prior.log_prob(all_bias))
+        print('bias', q_entity_bias.log_prob(all_bias))
+        print('emb', emb_entity_prior.log_prob(all_feat))
+        print('emb', q_entity.log_prob(all_feat))
+
+        # A = tf.sign(X_fm_batch)
+        # print(A)
+        # B = 1 / entity_rescale * (bias_entity_prior.log_prob(all_bias) - q_entity_bias.log_prob(all_bias) + emb_entity_prior.log_prob(all_feat) - q_entity.log_prob(all_feat))
+        # print(B)
+        # print('will work?', tf.sparse_tensor_dense_matmul(A, B))
+
+        print('X_fm ->', X_fm_batch.get_shape())
+        print('X_fm ->', tf.sign(X_fm_batch).get_shape())
+        print('rescale', entity_rescale)
+        print('u + i', nb_users + nb_items)
+
+        nb_occ = tf.sparse_reshape(tf.sparse_reduce_sum_sparse(X_fm_batch, axis=0), (1, -1))
+        print('sum X_fm ->', nb_occ.get_shape())
+
+        lp_lq = tf.reduce_sum(bias_entity_prior.log_prob(all_bias) - q_entity_bias.log_prob(all_bias) +
+                              emb_entity_prior.log_prob(all_feat) - q_entity.log_prob(all_feat), axis=0)
+        scaled_lp_lq = tf.reshape(1 / entity_rescale * lp_lq, (-1, 1))
+        relevant_scaled_lp_lq = tf.squeeze(tf.sparse_tensor_dense_matmul(nb_occ, scaled_lp_lq))
+
+        print('relevant', relevant_scaled_lp_lq)
+        print('relevant', relevant_scaled_lp_lq.shape)
+
+        elbo = (nb_samples[train_category] * tf.reduce_mean(likelihood.log_prob(outcomes)) + #tf.reduce_mean(sparse_pred.log_prob(outcomes)) +
+                relevant_scaled_lp_lq)
+        # elbo = (nb_samples[train_category] * tf.reduce_mean(sparse_pred.log_prob(outcomes)) +
+        #         tf.reduce_sum(bias_entity_prior.log_prob(all_bias) - q_entity_bias.log_prob(all_bias) +
+        #                       emb_entity_prior.log_prob(all_feat) - q_entity.log_prob(all_feat)))
+
+
     else:
         # elbo = tf.reduce_mean(
         #     nb_samples['train'] * likelihood.log_prob(outcomes) +
@@ -333,29 +386,42 @@ def define_variables(train_category, priors, sigma2):
         #                                  bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
         #                                  emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo')
 
-        elbo = tf.reduce_mean(
-            nb_samples[train_category] * likelihood.log_prob(outcomes) +
-            nb_samples[train_category] * 1/user_rescale * (bias_user_prior.log_prob(bias_users) - q_user_bias.log_prob(bias_users) +
+        # elbo = tf.reduce_mean(
+        #     nb_samples[train_category] * likelihood.log_prob(outcomes) +
+        #     nb_samples[train_category] * 1 / user_rescale * (bias_user_prior.log_prob(bias_users) - q_user_bias.log_prob(bias_users) +
+        #                       emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users)) +
+        #     nb_samples[train_category] * 1 / item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
+        #                       emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo')
+
+        elbo = (1 / nb_samples[train_category] * tf.reduce_mean(
+            nb_samples[train_category] * likelihood.log_prob(outcomes)) +
+            tf.reduce_sum(1 / user_rescale * (bias_user_prior.log_prob(bias_users) - q_user_bias.log_prob(bias_users) +
                               emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users)) +
-            nb_samples[train_category] * 1/item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
-                              emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo')
+                          1 / item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
+                              emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items))))
 
     sentinel = {
-        'pred': pred[0],
-        'outcome': outcomes[0],
-        'll log prob': -likelihood.log_prob(outcomes),
-        's ll log prob': -tf.reduce_sum(likelihood.log_prob(outcomes)),
-        's pred delta': tf.reduce_sum((pred - outcomes) ** 2 / 2 + np.log(2 * np.pi) / 2),
-        'bias sample': bias_users[0],
-        'bias log prob': -bias_user_prior.log_prob(bias_users)[0],
-        'sum bias log prob': -tf.reduce_sum(bias_user_prior.log_prob(bias_users)),
-        'bias mean': bias_user_prior.mean(),
-        'bias delta': bias_users[0] ** 2 / 2 + np.log(2 * np.pi) / 2,
-        'sum bias delta': tf.reduce_sum(bias_users ** 2 / 2 + np.log(2 * np.pi) / 2)
+        'nb outcomes': tf.shape(outcomes),
+        'nb samples': tf.constant(nb_samples[train_category]),
+        'users': entity[:5, 0],
+        # 'SNIRFL': tf.shape(relevant_scaled_lp_lq)
+        # 'll log prob': -likelihood.log_prob(outcomes),
+        # 'll log prob sparse': -sparse_pred.log_prob(outcomes),
+        # 's ll log prob': -tf.reduce_sum(likelihood.log_prob(outcomes)),
+        # 's pred delta': tf.reduce_sum((pred - outcomes) ** 2 / 2 + np.log(2 * np.pi) / 2),
+        # 'bias sample': bias_users[0],
+        # 'bias log prob': -bias_user_prior.log_prob(bias_users)[0],
+        # 'sum bias log prob': -tf.reduce_sum(bias_user_prior.log_prob(bias_users)),
+        # 'bias mean': bias_user_prior.mean(),
+        # 'bias delta': bias_users[0] ** 2 / 2 + np.log(2 * np.pi) / 2,
+        # 'sum bias delta': tf.reduce_sum(bias_users ** 2 / 2 + np.log(2 * np.pi) / 2)
     }
 
     infer_op = optimizer.minimize(-elbo)
-    return infer_op, elbo, pred, pred2, likelihood, sentinel
+    if options.sparse:
+        return infer_op, elbo, pred2, likelihood, sentinel
+    else:
+        return infer_op, elbo, pred, likelihood, sentinel
 
 # elbo4 = (# nb_samples['train'] * tf.reduce_mean(ll.log_prob(outcomes)) +
 #         nb_samples['train'] * sparse_pred.log_prob(outcomes) +
@@ -399,6 +465,8 @@ class VFM:
         self.patience = patience
         print('START', self.model_name())
 
+        self.batch_size = nb_samples[self.data['train']] // nb_iters  # All
+
     def model_name(self):
         if options.degenerate:
             title = 'fm-map'
@@ -426,7 +494,7 @@ class VFM:
             print('[%s] ' % category + ' '.join('{:s}={:f}'.format(metric, self.metrics[category][metric][-1]) for metric in self.metrics[category]))
 
     def run_and_save(self, category):
-        valid_pred, valid_pred2 = sess.run([self.pred, self.pred2], feed_dict=make_feed(self.data[category]))
+        valid_pred = sess.run(self.pred, feed_dict=make_feed(self.data[category]))
         # if category == 'valid' and self.data['valid'] != 'valid':
         #     print(np.isnan(valid_pred).any())
         #     print(valid_pred)
@@ -450,7 +518,7 @@ class VFM:
         priors = tf.constant(nb_occurrences[self.data['train']][:, None].repeat(embedding_size, axis=1), dtype=np.float32)
         scale = tf.constant(self.sigma2)
         with tf.variable_scope(self.model_name()):
-            infer_op, elbo, self.pred, self.pred2, likelihood, sentinel = define_variables(self.data['train'], priors, self.sigma2)
+            infer_op, elbo, self.pred, likelihood, sentinel = define_variables(self.data['train'], priors, self.sigma2)
 
         sess.run(tf.global_variables_initializer())
         
@@ -461,11 +529,11 @@ class VFM:
             dt = time.time()
             train_elbos = []
             for nb_iter in range(nb_iters):
-                batch_ids = np.random.randint(0, nb_samples[self.data['train']], size=batch_size)
+                batch_ids = np.random.randint(0, nb_samples[self.data['train']], size=self.batch_size)
                 X['batch'] = X[self.data['train']][batch_ids]
                 y['batch'] = y[self.data['train']][batch_ids]
-                indices = np.column_stack((np.arange(batch_size).repeat(2), X['batch'].flatten()))
-                X_sp['batch'] = tf.SparseTensorValue(indices, np.ones(2 * batch_size), [batch_size, nb_users + nb_items])
+                # indices = np.column_stack((np.arange(batch_size).repeat(2), X['batch'].flatten()))
+                X_sp['batch'] = make_sparse_tf(X_fm[batch_ids])#tf.SparseTensorValue(indices, np.ones(2 * batch_size), [batch_size, nb_users + nb_items])
 
                 _, train_elbo = sess.run([infer_op, elbo], feed_dict=make_feed('batch'))
 
@@ -485,11 +553,11 @@ class VFM:
             has_to_stop, watched_values = self.stopping_rule()
 
             self.metrics['train']['epoch'].append(self.epoch)
-            self.metrics['train']['elbo'].append(np.mean(train_elbos) / nb_samples[self.data['train']])
+            self.metrics['train']['elbo'].append(np.mean(train_elbos))
             if VERBOSE >= 10:
                 self.run_and_save('train')
                 
-            if VERBOSE or self.epoch % 5000 == 0 or has_to_stop:
+            if VERBOSE >= 5 or self.epoch % 5000 == 0 or has_to_stop:
                 self.run_and_save('test')
 
             if VERBOSE:
