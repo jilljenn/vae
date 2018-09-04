@@ -19,7 +19,8 @@ import time
 import sys
 
 
-DESCRIPTION = 'Sparse mode, not yet global_bias variational approximation'
+DESCRIPTION = 'Rescaled sparse mode, not yet global_bias variational approximation'
+SUFFIX = 'rescaled'
 start_time = time.time()
 
 parser = argparse.ArgumentParser(description='Run VFM')
@@ -29,7 +30,8 @@ parser.add_argument('--sparse', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--regression', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--classification', type=bool, nargs='?', const=True, default=False)
 
-parser.add_argument('--patience', type=int, nargs='?', default=4)
+parser.add_argument('--valid_patience', type=int, nargs='?', default=10)
+parser.add_argument('--train_patience', type=int, nargs='?', default=4)
 parser.add_argument('--d', type=int, nargs='?', default=20)
 parser.add_argument('--gamma', type=float, nargs='?', default=0.01)
 parser.add_argument('--nb_batches', type=int, nargs='?', default=1)
@@ -270,7 +272,7 @@ def make_sparse_pred_reg(sigma2, x):
                                   tf.sparse_tensor_dense_matmul(x2, V2), axis=1))
     return tfd.Normal(logits, scale=sigma2)
 
-def define_variables(train_category, priors, sigma2):
+def define_variables(train_category, priors, sigma2, batch_size):
     if options.degenerate:
         emb_user_prior = make_embedding_prior()
         emb_item_prior = make_embedding_prior()
@@ -288,7 +290,7 @@ def define_variables(train_category, priors, sigma2):
 
     user_rescale = tf.nn.embedding_lookup(priors, user_batch)[:, 0]
     item_rescale = tf.nn.embedding_lookup(priors, item_batch)[:, 0]
-    entity_rescale = 1 + priors[:, 0]
+    entity_rescale = priors[:, 0]
 
     if is_classification:
         likelihood = make_likelihood(feat_users, feat_items, bias_users, bias_items)
@@ -328,7 +330,6 @@ def define_variables(train_category, priors, sigma2):
         #          tf.nn.l2_loss(feat_users) + tf.nn.l2_loss(feat_items)))
         elbo = tf.reduce_mean(
             likelihood.log_prob(outcomes) +
-            # nb_samples['train'] * sparse_pred.log_prob(outcomes) +
             1 / user_rescale * (bias_user_prior.log_prob(bias_users) + emb_user_prior.log_prob(feat_users)) +
             1 / item_rescale * (bias_item_prior.log_prob(bias_items) + emb_user_prior.log_prob(feat_items)), name='elbo')
     # / 2 : 1.27
@@ -338,11 +339,12 @@ def define_variables(train_category, priors, sigma2):
 
         lp_lq = tf.reduce_sum(bias_entity_prior.log_prob(all_bias) - q_entity_bias.log_prob(all_bias) +
                               emb_entity_prior.log_prob(all_feat) - q_entity.log_prob(all_feat), axis=0)
-        scaled_lp_lq = tf.reshape(1 / entity_rescale * lp_lq, (-1, 1))
-        relevant_scaled_lp_lq = tf.squeeze(tf.sparse_tensor_dense_matmul(nb_occ, scaled_lp_lq))
+        nonzero_entity_rescale = 1 + tf.maximum(0., entity_rescale - 1)
+        lp_lq = tf.reshape(lp_lq / nonzero_entity_rescale, (-1, 1))
+        relevant_scaled_lp_lq = tf.squeeze(tf.sparse_tensor_dense_matmul(nb_occ, lp_lq))
 
         elbo = (tf.reduce_mean(sparse_pred.log_prob(outcomes)) +
-                relevant_scaled_lp_lq / nb_samples[train_category])
+                relevant_scaled_lp_lq / batch_size)
 
     else:
         # elbo = tf.reduce_mean(
@@ -360,11 +362,11 @@ def define_variables(train_category, priors, sigma2):
         #     nb_samples[train_category] * 1 / item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
         #                       emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo')
 
-        elbo = (1 / nb_samples[train_category] * (tf.reduce_mean(nb_samples[train_category] * likelihood.log_prob(outcomes)) +
-            tf.reduce_sum(1 / user_rescale * (bias_user_prior.log_prob(bias_users) - q_user_bias.log_prob(bias_users) +
-                              emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users)) +
-                          1 / item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
-                              emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)))))
+        elbo = tf.reduce_mean(likelihood.log_prob(outcomes) +
+                              1 / user_rescale * (bias_user_prior.log_prob(bias_users) - q_user_bias.log_prob(bias_users) +
+                                                  emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users)) +
+                              1 / item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
+                                                  emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)))
 
     sentinel = {
         'nb outcomes': tf.shape(outcomes),
@@ -377,6 +379,8 @@ def define_variables(train_category, priors, sigma2):
         'll log prob sparse has nan': tf.reduce_any(tf.is_nan(sparse_pred.log_prob(outcomes))),
         # 's ll log prob': -tf.reduce_sum(likelihood.log_prob(outcomes)),
         # 's pred delta': tf.reduce_sum((pred - outcomes) ** 2 / 2 + np.log(2 * np.pi) / 2),
+        'entity_rescale sum': tf.reduce_sum(entity_rescale),
+        'nb occ sum': tf.constant(nb_occurrences[train_category].sum()),
         # 'logits': logits,
         # 'max logits': tf.reduce_max(logits),
         # 'min logits': tf.reduce_min(logits),
@@ -427,7 +431,7 @@ def make_feed(category):
 
 
 class VFM:
-    def __init__(self, train_category, valid_category, sigma2, stop_when_worse, patience=options.patience):
+    def __init__(self, train_category, valid_category, sigma2, stop_when_worse, train_patience=options.train_patience, valid_patience=options.valid_patience):
         self.start_time = time.time()
         self.data = {
             'train': train_category,
@@ -442,7 +446,8 @@ class VFM:
             'time': {}
         }
         self.category_watcher, self.metric_watcher = stop_when_worse
-        self.patience = patience
+        self.train_patience = train_patience
+        self.valid_patience = valid_patience
         print('START', self.model_name())
 
         self.batch_size = nb_samples[self.data['train']] // nb_iters  # All
@@ -454,17 +459,33 @@ class VFM:
             title = 'vfm-sparse'
         else:
             title = 'vfm'
-        return '{:s}-{:s}-{:s}-{:.2f}'.format(DATA, title, self.data['train'], self.sigma2)
+        name = '{:s}-{:s}-{:s}-{:.2f}'.format(DATA, title, self.data['train'], self.sigma2)
+        if SUFFIX:
+            name += '-' + SUFFIX
+        return name
 
     def stopping_rule(self):
-        last_values = self.metrics[self.category_watcher][self.metric_watcher][-self.patience:]
-        is_decreasing = self.metric_watcher in {'acc', 'auc', 'elbo'}  # If these metrics decrease, it's worse
-        return (self.epoch >= MAX_EPOCHS or (len(last_values) >= self.patience and last_values == sorted(last_values, reverse=is_decreasing))), last_values
+        K = 5        
+        if self.category_watcher == 'train':
+            last_values = self.metrics[self.category_watcher][self.metric_watcher][-self.train_patience:]
+            is_decreasing = self.metric_watcher in {'acc', 'auc', 'elbo'}  # If these metrics decrease, it's worse
+            return (self.epoch >= MAX_EPOCHS or (len(last_values) >= self.train_patience and last_values == sorted(last_values, reverse=is_decreasing))), last_values
+        elif self.epoch < K - 1 or self.epoch % self.valid_patience != 0:
+            return False, []
+        else:  # Try tracking quotient
+            train = self.metrics['train']['elbo']
+            strip = train[-K:]
+            progress = 1000 * (sum(strip) / (K * max(strip)) - 1)
+            valid = self.metrics['valid'][self.metric_watcher]  # Most possibly RMSE
+            gen_loss = 100 * (valid[-1] / min(valid) - 1)
+            quotient = gen_loss / progress
+            return quotient > 0.2, valid[-2:]
 
     def save_metrics(self, category, epoch, y_truth, y_pred):
         if VERBOSE:
             print('[%s] pred' % category, y_truth[:5], y_pred[:5])
-        self.metrics[category]['epoch'].append(epoch)
+        if epoch not in self.metrics[category]['epoch']:
+            self.metrics[category]['epoch'].append(epoch) 
         self.metrics[category]['acc'].append(np.mean(y_truth == np.round(y_pred)))
         self.metrics[category]['rmse'].append(mean_squared_error(y_truth, y_pred) ** 0.5)
         if set(y_truth) == {0., 1.}:
@@ -496,7 +517,7 @@ class VFM:
         priors = tf.constant(nb_occurrences[self.data['train']][:, None].repeat(embedding_size, axis=1), dtype=np.float32)
         scale = tf.constant(self.sigma2)
         with tf.variable_scope(self.model_name()):
-            infer_op, elbo, self.pred, likelihood, sentinel = define_variables(self.data['train'], priors, self.sigma2)
+            infer_op, elbo, self.pred, likelihood, sentinel = define_variables(self.data['train'], priors, self.sigma2, self.batch_size)
 
         sess.run(tf.global_variables_initializer())
         
@@ -525,16 +546,18 @@ class VFM:
             if self.epoch == 1:
                 self.metrics['time']['per_epoch'] = time.time() - dt
 
-            if self.data['valid'] == 'valid' and self.epoch % 10 == 0:
+            if self.data['valid'] == 'valid' and self.epoch % self.valid_patience == 0:
                 self.run_and_save('valid')
-            has_to_stop, watched_values = self.stopping_rule()
 
             self.metrics['train']['epoch'].append(self.epoch)
             self.metrics['train']['elbo'].append(np.mean(train_elbos).astype(np.float64))
+
+            has_to_stop, watched_values = self.stopping_rule()
+
             if VERBOSE >= 10:
                 self.run_and_save('train')
                 
-            if VERBOSE >= 5 or self.epoch % 10 == 0 or has_to_stop:
+            if self.epoch % 10 == 0 or has_to_stop:
                 self.run_and_save('test')
 
             if VERBOSE:
@@ -554,7 +577,8 @@ class VFM:
 
         self.save_logs()
 
-        return self.metrics[self.category_watcher][self.metric_watcher][-self.patience]  # Best metric reported so far
+        # return self.metrics[self.category_watcher][self.metric_watcher][-self.train_patience]  # Best metric reported so far
+        return min(self.metrics[self.category_watcher][self.metric_watcher][-2:])  # Min valid RMSE of last 2 steps
 
 
 stopped_at = None
