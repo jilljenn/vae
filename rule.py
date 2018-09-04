@@ -15,6 +15,8 @@ criteria = defaultdict(lambda: defaultdict(list))
 with open(log_name) as f:
     data = json.load(f)
 
+metric_name = 'auc' if data['args']['data'] == 'fraction' else 'rmse'
+
 train_epochs = np.unique(sorted(data['metrics']['train']['epoch']))
 print('Train', min(train_epochs), max(train_epochs))
 train = data['metrics']['train']['elbo']
@@ -36,7 +38,7 @@ all_progress = dict(zip(criteria['progress']['epoch'], criteria['progress']['val
 
 # Track generalization loss on valid
 if cv:
-    valid = data['metrics']['valid']['rmse']
+    valid = data['metrics']['valid'][metric_name]
 
     for i, v in enumerate(valid):
         epoch = data['metrics']['valid']['epoch'][i]
@@ -53,21 +55,22 @@ if cv:
         criteria['quotient']['value'].append(quotient)
 
 
-fig, ((elbo, rmse), (_, criterion_graph)) = plt.subplots(2, 2, figsize=(8, 8))
+fig, ((elbo, metric), (_, criterion_graph)) = plt.subplots(2, 2, figsize=(8, 8))
 elbo.plot(train_epochs, data['metrics']['train']['elbo'], label='train elbo')
-if 'rmse' in data['metrics']['train']:
-    rmse.plot(train_epochs, data['metrics']['train']['rmse'], label='train rmse')
-rmse.plot(data['metrics']['test']['epoch'], data['metrics']['test']['rmse'], label='test')
+if metric_name in data['metrics']['train']:
+    metric.plot(train_epochs, data['metrics']['train'][metric_name], label='train {:s}'.format(metric_name))
+metric.plot(data['metrics']['test']['epoch'], data['metrics']['test'][metric_name], label='test')
 
 if cv:
-    rmse.plot(data['metrics']['valid']['epoch'], data['metrics']['valid']['rmse'], label='valid')
+    metric.plot(data['metrics']['valid']['epoch'], data['metrics']['valid'][metric_name], label='valid')
     criterion_graph.hlines(0.2, min(criteria['quotient']['epoch']), max(criteria['quotient']['epoch']))
 
 for criterion in {'gen_loss', 'quotient'} if cv else {'progress'}:
     criterion_graph.plot(criteria[criterion]['epoch'], criteria[criterion]['value'], label=criterion)
 
-rmse.set_title('RMSE ↓ over epochs')
-rmse.set_ylim(ymax=2)
+metric.set_title('{:s} over epochs'.format(metric_name.upper()))
+if metric_name == 'rmse':
+    metric.set_ylim(ymax=2)
 elbo.set_title('Elbo ↑ over epochs')
 criterion_graph.set_title('Stopping rules over epochs')
 fig.legend()
