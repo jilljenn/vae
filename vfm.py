@@ -19,8 +19,8 @@ import time
 import sys
 
 
-DESCRIPTION = 'Rescaled sparse mode, not yet global_bias variational approximation'
-SUFFIX = 'rescaled'
+DESCRIPTION = 'Rescaled mode and test every step'
+SUFFIX = 'forced'
 start_time = time.time()
 
 parser = argparse.ArgumentParser(description='Run VFM')
@@ -32,8 +32,9 @@ parser.add_argument('--classification', type=bool, nargs='?', const=True, defaul
 
 parser.add_argument('--valid_patience', type=int, nargs='?', default=10)
 parser.add_argument('--train_patience', type=int, nargs='?', default=4)
-parser.add_argument('--d', type=int, nargs='?', default=20)
+parser.add_argument('--d', type=int, nargs='?', default=3)
 parser.add_argument('--gamma', type=float, nargs='?', default=0.01)
+parser.add_argument('--sigma2', type=float, nargs='?', default=-1)
 parser.add_argument('--nb_batches', type=int, nargs='?', default=1)
 options = parser.parse_args()
  
@@ -44,11 +45,12 @@ else:
 
 DATA = options.data
 print('Data is', DATA)
-VERBOSE = 0
+VERBOSE = 1
 NB_SAMPLES = 1
+COMPUTE_TEST_EVERY = 1
 
 # Load data
-if DATA in {'fraction', 'mangaki', 'movie1M', 'movie10M', 'movie100k'}:
+if DATA in {'fraction', 'movie1M', 'movie10M', 'movie100k'}:
     df = pd.read_csv(os.path.join(PATH, 'vae/data', DATA, 'data.csv'))
     print('Starts at', df['user'].min(), df['item'].min())
     try:
@@ -105,7 +107,8 @@ i['train'], i['valid'] = train_test_split(i['trainval'], test_size=0.2)
 data = {key: df.iloc[i[key]] for key in {'train', 'valid', 'trainval', 'test'}}
 
 X = {}
-X_sp = {}
+# X_sp = {}
+X_sp = {'batch': []}
 y = {}
 nb_samples = {}
 nb_occurrences = {
@@ -531,7 +534,7 @@ class VFM:
                 batch_ids = np.random.randint(0, nb_samples[self.data['train']], size=self.batch_size)
                 X['batch'] = X[self.data['train']][batch_ids]
                 y['batch'] = y[self.data['train']][batch_ids]
-                X_sp['batch'] = make_sparse_tf(X_fm[i[self.data['train']]][batch_ids])
+                # X_sp['batch'] = make_sparse_tf(X_fm[i[self.data['train']]][batch_ids])
 
                 _, train_elbo = sess.run([infer_op, elbo], feed_dict=make_feed('batch'))
 
@@ -557,7 +560,7 @@ class VFM:
             if VERBOSE >= 10:
                 self.run_and_save('train')
                 
-            if self.epoch % 10 == 0 or has_to_stop:
+            if self.epoch % COMPUTE_TEST_EVERY == 0 or has_to_stop:
                 self.run_and_save('test')
 
             if VERBOSE:
@@ -590,6 +593,8 @@ with tf.Session() as sess:
     
     if is_classification:
         best_sigma = 0.
+    elif options.sigma2 != -1:
+        best_sigma = options.sigma2
     else:  # Have to find sigma2 via cross validation
         sigma2s = [0.1, 0.2, 0.5, 1.]
         valid_metrics = []
