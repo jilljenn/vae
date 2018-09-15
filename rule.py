@@ -71,36 +71,42 @@ if cv:
 
 
 if cv:
-    fig, ((elbo, metric), (_, criterion_graph)) = plt.subplots(2, 2, figsize=(8, 8))
+    fig, ((elbo, metric), (progress_graph, criterion_graph)) = plt.subplots(2, 2, figsize=(8, 8))
 else:
-    fig, (elbo, metric) = plt.subplots(1, 2, figsize=(8, 4))
-elbo.plot(train_epochs, data['metrics']['train']['elbo'], label='train elbo')
+    fig, metric = plt.subplots(1, 1, figsize=(4, 4))
+
 if metric_name in data['metrics']['train']:
     metric.plot(train_epochs, data['metrics']['train'][metric_name], label='train {:s}'.format(metric_name))
-metric.plot(data['metrics']['test']['epoch'], data['metrics']['test'][metric_name], label='test')
+metric.plot(data['metrics']['test']['epoch'], data['metrics']['test'][metric_name], label='VFM')
 MAX_EPOCH = max(data['metrics']['test']['epoch'])
 
-if dataset in mcmc:
-    df = pd.read_csv(mcmc[dataset])
-    metric.plot(1 + df.index[:MAX_EPOCH], df['rmse'][:MAX_EPOCH], label='libFM MCMC')
-
-if dataset in als:
-    df = pd.read_csv(als[dataset])
-    metric.plot(1 + df.index[:MAX_EPOCH], df['rmse'][:MAX_EPOCH], label='libFM ALS')
-
 if cv:
+    elbo.plot(train_epochs, data['metrics']['train']['elbo'], label='train elbo')
+    elbo.set_title('Elbo ↑ over epochs')
+
     metric.plot(data['metrics']['valid']['epoch'], data['metrics']['valid'][metric_name], label='valid')
     criterion_graph.hlines(0.2, min(criteria['quotient']['epoch']), max(criteria['quotient']['epoch']))
 
     for criterion in {'gen_loss', 'quotient'}:# if cv else {'progress'}:
         criterion_graph.plot(criteria[criterion]['epoch'], criteria[criterion]['value'], label=criterion)
+    progress_graph.plot(criteria['progress']['epoch'], criteria['progress']['value'], label='progress')
 
     criterion_graph.set_title('Stopping rules over epochs')
+    criterion_graph.legend()
+    progress_graph.set_title('Progress of ELBO')
+else:
+    if dataset in mcmc:
+        df = pd.read_csv(mcmc[dataset])
+        metric.plot(1 + df.index[:MAX_EPOCH], df['rmse'][:MAX_EPOCH], label='libFM MCMC')
 
-metric.set_title('{:s} over epochs'.format(metric_name.upper()))
+    if dataset in als:
+        df = pd.read_csv(als[dataset])
+        metric.plot(1 + df.index[:MAX_EPOCH], df['rmse'][:MAX_EPOCH], label='libFM ALS')
+
+metric.set_title('Test {:s} ↓ over epochs'.format(metric_name.upper()))
+metric.legend()
 if metric_name == 'rmse':
     metric.set_ylim(ymax=2)
-elbo.set_title('Elbo ↑ over epochs')
-fig.legend()
+# fig.legend()
 fig.savefig('{:s}'.format(fig_name, format='pdf'))
 os.system('open {:s}'.format(fig_name))
