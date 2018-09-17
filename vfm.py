@@ -19,8 +19,8 @@ import time
 import sys
 
 
-DESCRIPTION = 'Rescaled mode and test every step'
-SUFFIX = 'forced'
+DESCRIPTION = 'Batches from tf.data'
+SUFFIX = 'tfdata'
 start_time = time.time()
 
 parser = argparse.ArgumentParser(description='Run VFM')
@@ -45,9 +45,9 @@ else:
 
 DATA = options.data
 print('Data is', DATA)
-VERBOSE = 1
+VERBOSE = 10
 NB_SAMPLES = 1
-COMPUTE_TEST_EVERY = 1
+COMPUTE_TEST_EVERY = 100
 
 # Load data
 if DATA in {'fraction', 'movie1M', 'movie10M', 'movie100k'}:
@@ -107,20 +107,17 @@ i['train'], i['valid'] = train_test_split(i['trainval'], test_size=0.2)
 data = {key: df.iloc[i[key]] for key in {'train', 'valid', 'trainval', 'test'}}
 
 X = {}
-# X_sp = {}
-X_sp = {'batch': []}
+X_sp_ind = {}
+X_sp_val = {}
+tf_dataset = {}
+init_op = {}
 y = {}
 nb_samples = {}
 nb_occurrences = {
     'train': X_fm[i['train']].sum(axis=0).A1,
     'trainval': X_fm[i['trainval']].sum(axis=0).A1
 }
-
-def make_sparse_tf(X_fm):
-    nb_rows, _ = X_fm.shape
-    rows, cols, data = find(X_fm)
-    indices = list(zip(rows, cols))
-    return tf.SparseTensorValue(indices, data, [nb_rows, nb_users + nb_items + nb_skills])
+nb_iters = options.nb_batches
 
 for category in data:
     X[category] = np.array(data[category][['user', 'item']])
@@ -130,16 +127,47 @@ for category in data:
     else:
         y[category] = np.array(data[category]['outcome']).astype(np.float32)
     nb_samples[category] = len(X[category])
-    X_sp[category] = make_sparse_tf(X_fm[i[category]])
+    S = X_fm[i[category]].tocoo()
+    # Have to sort the indices properly, otherwise tf.data will cry (bug to report)
+    entries = np.column_stack((S.row, S.col, S.data))
+    indices = np.lexsort((S.col, S.row))
+    # Build TF-specific datasets
+    X_sp_ind[category] = tf.SparseTensor(indices=entries[indices, :2], values=entries[indices, 1], dense_shape=S.shape)
+    X_sp_val[category] = tf.SparseTensor(indices=entries[indices, :2], values=entries[indices, 2], dense_shape=S.shape)
+    X_ind_data = tf.data.Dataset.from_tensor_slices(X_sp_ind[category])
+    X_val_data = tf.data.Dataset.from_tensor_slices(X_sp_val[category])
+    y_data = tf.data.Dataset.from_tensor_slices(tf.constant(y[category]))
+    if 'train' in category:
+        batch_size = nb_samples[category] // nb_iters
+        tf_dataset[category] = tf.data.Dataset.zip((X_ind_data, X_val_data, y_data)).shuffle(10000).batch(batch_size)
+    else:
+        tf_dataset[category] = tf.data.Dataset.zip((X_ind_data, X_val_data, y_data)).batch(nb_samples[category])
 
 # Config
 MAX_EPOCHS = 500
 print('Nb samples', nb_samples['train'])
 embedding_size = options.d
-nb_iters = options.nb_batches
 print('Nb iters', nb_iters)
 gamma = options.gamma  # gamma 0.001 works better for classification
 
+dt = time.time()
+
+# Prepare batches
+
+# user_data = tf.data.Dataset.from_tensor_slices(X_train[:, 0])
+# item_data = tf.data.Dataset.from_tensor_slices(X_train[:, 1])
+# dataset = tf.data.Dataset.zip((X_data, y_data, user_data, item_data)).batch(batch_size)
+# X_fm_batch, outcomes, user_batch, item_batch = iterator.get_next()
+iterator = tf.data.Iterator.from_structure(output_types=tf_dataset['train'].output_types,
+                                           output_shapes=tf_dataset['train'].output_shapes,
+                                           output_classes=tf_dataset['train'].output_classes)
+_, X_fm_batch, outcomes = iterator.get_next()
+X_fm_batch = tf.cast(X_fm_batch, tf.float32)
+
+for category in data:
+    init_op[category] = iterator.make_initializer(tf_dataset[category])
+
+print('Prepare data', time.time() - dt)
 dt = time.time()
 
 global_bias = tf.get_variable('global_bias', shape=[], initializer=tf.truncated_normal_initializer(stddev=0.1))
@@ -203,8 +231,6 @@ def make_entity_bias(entity_batch):
 
 user_batch = tf.placeholder(tf.int32, shape=[None], name='user_batch')
 item_batch = tf.placeholder(tf.int32, shape=[None], name='item_batch')
-X_fm_batch = tf.sparse_placeholder(tf.float32, shape=[None, nb_users + nb_items + nb_skills], name='sparse_batch')
-outcomes = tf.placeholder(tf.float32, shape=[None], name='outcomes')
 
 # mu0 = make_mu().sample()
 # lambda0 = make_lambda().sample()
@@ -498,7 +524,8 @@ class VFM:
             print('[%s] ' % category + ' '.join('{:s}={:f}'.format(metric, self.metrics[category][metric][-1]) for metric in self.metrics[category]))
 
     def run_and_save(self, category):
-        valid_pred = sess.run(self.pred, feed_dict=make_feed(self.data[category]))
+        sess.run(init_op[category])
+        valid_pred = sess.run(self.pred)
         self.save_metrics(category, self.epoch, y[self.data[category]], valid_pred)
 
     def save_logs(self):
@@ -527,44 +554,54 @@ class VFM:
         self.epoch = 0
         while True:
             self.epoch += 1
+            sess.run(init_op[self.data['train']])
             
             dt = time.time()
             train_elbos = []
-            for nb_iter in range(nb_iters):
-                batch_ids = np.random.randint(0, nb_samples[self.data['train']], size=self.batch_size)
-                X['batch'] = X[self.data['train']][batch_ids]
-                y['batch'] = y[self.data['train']][batch_ids]
+            while True:
+                # batch_ids = np.random.randint(0, nb_samples[self.data['train']], size=self.batch_size)
+                # X['batch'] = X[self.data['train']][batch_ids]
+                # y['batch'] = y[self.data['train']][batch_ids]
                 # X_sp['batch'] = make_sparse_tf(X_fm[i[self.data['train']]][batch_ids])
 
-                _, train_elbo = sess.run([infer_op, elbo], feed_dict=make_feed('batch'))
+                try:
+                    variables = [infer_op, elbo]
+                    if VERBOSE >= 100:
+                        variables.extend([sentinel[key] for key in sentinel])
 
-                if VERBOSE >= 100:
-                    values = sess.run([sentinel[key] for key in sentinel], feed_dict=make_feed('batch'))
-                    for key, val in zip(sentinel, values):
+                    values = sess.run(variables)
+                    train_elbos.append(values[1])  # Store train ELBO
+
+                    for key, val in zip(sentinel, values[2:]):  # For debug
                         print(key, val)
 
-                train_elbos.append(train_elbo)
-                if nb_iter == 0:
-                    self.metrics['time']['per_batch'] = time.time() - dt
-            if self.epoch == 1:
-                self.metrics['time']['per_epoch'] = time.time() - dt
+                    if 'per_batch' not in self.metrics['time']:
+                        self.metrics['time']['per_batch'] = time.time() - dt
 
-            if self.data['valid'] == 'valid' and self.epoch % self.valid_patience == 0:
-                self.run_and_save('valid')
+                except tf.errors.OutOfRangeError:
+                    print('Finished epoch')
 
-            self.metrics['train']['epoch'].append(self.epoch)
-            self.metrics['train']['elbo'].append(np.mean(train_elbos).astype(np.float64))
+                    if self.epoch == 1:
+                        self.metrics['time']['per_epoch'] = time.time() - dt
 
-            has_to_stop, watched_values = self.stopping_rule()
+                    if self.data['valid'] == 'valid' and self.epoch % self.valid_patience == 0:
+                        self.run_and_save('valid')
 
-            if VERBOSE >= 10:
-                self.run_and_save('train')
-                
-            if self.epoch % COMPUTE_TEST_EVERY == 0 or has_to_stop:
-                self.run_and_save('test')
+                    self.metrics['train']['epoch'].append(self.epoch)
+                    self.metrics['train']['elbo'].append(np.mean(train_elbos).astype(np.float64))
 
-            if VERBOSE:
-                print('{:.3f}s [{}] Epoch {}: Lower bound = {}'.format(time.time() - dt, self.model_name(), self.epoch, self.metrics['train']['elbo'][-1]))
+                    has_to_stop, watched_values = self.stopping_rule()
+
+                    # if VERBOSE >= 10:
+                    #     self.run_and_save('train')
+                        
+                    if self.epoch % COMPUTE_TEST_EVERY == 0 or has_to_stop:
+                        self.run_and_save('test')
+
+                    if VERBOSE:
+                        print('{:.3f}s [{}] Epoch {}: Lower bound = {}'.format(time.time() - dt, self.model_name(), self.epoch, self.metrics['train']['elbo'][-1]))
+
+                    break
 
             if has_to_stop:
                 break
