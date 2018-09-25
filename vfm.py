@@ -19,8 +19,8 @@ import time
 import sys
 
 
-DESCRIPTION = 'Batches from tf.data'
-SUFFIX = 'tfdata'
+DESCRIPTION = 'Batches from tf.data with massive data'
+SUFFIX = 'bigdata'
 start_time = time.time()
 
 parser = argparse.ArgumentParser(description='Run VFM')
@@ -45,90 +45,50 @@ else:
 
 DATA = options.data
 print('Data is', DATA)
-VERBOSE = 10
+VERBOSE = 50
 NB_SAMPLES = 1
 COMPUTE_TEST_EVERY = 100
 
 # Load data
-if DATA in {'fraction', 'movie1M', 'movie10M', 'movie100k'}:
-    df = pd.read_csv(os.path.join(PATH, 'vae/data', DATA, 'data.csv'))
-    print('Starts at', df['user'].min(), df['item'].min())
-    try:
-        with open(os.path.join(PATH, 'vae/data', DATA, 'config.yml')) as f:
-            config = yaml.load(f)
-            nb_users = config['nb_users']
-            nb_items = config['nb_items']
-    except IOError:
-        nb_users = 1 + df['user'].max()
-        nb_items = 1 + df['item'].max()
-    df['item'] += nb_users
-    print(df.head())
-else:
+if DATA not in {'duolingo', 'fraction0', 'fraction', 'movie1M', 'movie10M', 'movie100k'}:
     print('Please use an available dataset')
-    assert False
+    sys.exit(0)
 
 # Is it classification or regression?
-if options.regression or 'rating' in df:
-    is_regression = True
-    is_classification = False
-elif options.classification or 'outcome' in df:
-    is_classification = True
-    is_regression = False
-
-nb_entries = len(df)
-
-# Build sparse features
-X_fm_file = os.path.join(PATH, 'vae/data', DATA, 'X_fm.npz')
-if not os.path.isfile(X_fm_file):
-    rows = np.arange(nb_entries).repeat(2)
-    cols = np.array(df[['user', 'item']]).flatten()
-    data = np.ones(2 * nb_entries)
-    X_fm = coo_matrix((data, (rows, cols)), shape=(nb_entries, nb_users + nb_items)).tocsr()
-
-    q_file = X_fm_file.replace('X_fm', 'q')
-    if os.path.isfile(q_file):
-        q = load_npz(q_file)
-        X_fm = hstack((X_fm, q[df['item'] - nb_users])).tocsr()
-
-    if is_regression:
-        y_fm = np.array(df['rating'])
-    else:
-        y_fm = np.array(df['outcome']).astype(np.float32)
-    save_npz(X_fm_file, X_fm)
-    np.save(os.path.join(PATH, 'vae/data', DATA, 'y_fm.npy'), y_fm)
-else:
-    X_fm = load_npz(X_fm_file)
-
-nb_skills = X_fm.shape[1] - nb_users - nb_items
-
-i = {}
-i['trainval'], i['test'] = train_test_split(list(range(nb_entries)), test_size=0.2)
-i['train'], i['valid'] = train_test_split(i['trainval'], test_size=0.2)
-data = {key: df.iloc[i[key]] for key in {'train', 'valid', 'trainval', 'test'}}
+is_regression = options.regression
+is_classification = options.classification
 
 X = {}
+y = {}
+i = {}
+X['trainval'] = load_npz(os.path.join(PATH, 'vae/data', DATA, 'X_fm.npz'))
+y['trainval'] = np.load(os.path.join(PATH, 'vae/data', DATA, 'y_fm.npy')).astype(np.float32)
+X['test'] = load_npz(os.path.join(PATH, 'vae/data', DATA, 'X_test.npz'))
+y['test'] = np.load(os.path.join(PATH, 'vae/data', DATA, 'y_test.npy')).astype(np.float32)
+
+nb_users = 1213
+nb_items = 2417
+nb_skills = X['trainval'].shape[1] - nb_users - nb_items
+
+data = {'trainval', 'test'}
+
 X_sp_ind = {}
 X_sp_val = {}
 tf_dataset = {}
 init_op = {}
-y = {}
 nb_samples = {}
 nb_occurrences = {
-    'train': X_fm[i['train']].sum(axis=0).A1,
-    'trainval': X_fm[i['trainval']].sum(axis=0).A1
+    # 'train': X_fm[i['train']].sum(axis=0).A1,
+    'trainval': X['trainval'].sum(axis=0).A1
 }
 nb_iters = options.nb_batches
 
 for category in data:
-    X[category] = np.array(data[category][['user', 'item']])
     print(category, X[category].size)
-    if is_regression:
-        y[category] = np.array(data[category]['rating']).astype(np.float32)
-    else:
-        y[category] = np.array(data[category]['outcome']).astype(np.float32)
-    nb_samples[category] = len(X[category])
-    S = X_fm[i[category]].tocoo()
-    # Have to sort the indices properly, otherwise tf.data will cry (bug to report)
+    nb_samples[category], _ = X[category].shape
+    i[category] = list(range(nb_samples[category]))
+    S = X[category][i[category]].tocoo()
+    # Have to sort the indices properly, otherwise tf.data will cry (reported bug)
     entries = np.column_stack((S.row, S.col, S.data))
     indices = np.lexsort((S.col, S.row))
     # Build TF-specific datasets
@@ -145,7 +105,7 @@ for category in data:
 
 # Config
 MAX_EPOCHS = 500
-print('Nb samples', nb_samples['train'])
+print('Nb samples', nb_samples['trainval'])
 embedding_size = options.d
 print('Nb iters', nb_iters)
 gamma = options.gamma  # gamma 0.001 works better for classification
@@ -158,9 +118,9 @@ dt = time.time()
 # item_data = tf.data.Dataset.from_tensor_slices(X_train[:, 1])
 # dataset = tf.data.Dataset.zip((X_data, y_data, user_data, item_data)).batch(batch_size)
 # X_fm_batch, outcomes, user_batch, item_batch = iterator.get_next()
-iterator = tf.data.Iterator.from_structure(output_types=tf_dataset['train'].output_types,
-                                           output_shapes=tf_dataset['train'].output_shapes,
-                                           output_classes=tf_dataset['train'].output_classes)
+iterator = tf.data.Iterator.from_structure(output_types=tf_dataset['trainval'].output_types,
+                                           output_shapes=tf_dataset['trainval'].output_shapes,
+                                           output_classes=tf_dataset['trainval'].output_classes)
 _, X_fm_batch, outcomes = iterator.get_next()
 X_fm_batch = tf.cast(X_fm_batch, tf.float32)
 
@@ -450,13 +410,6 @@ def define_variables(train_category, priors, sigma2, batch_size):
 #                       emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo2')
 
 optimizer = tf.train.AdamOptimizer(gamma)  # 0.001
-
-
-def make_feed(category):
-    return {user_batch: X[category][:, 0],
-            item_batch: X[category][:, 1],
-            outcomes: y[category],
-            X_fm_batch: X_sp[category]}
 
 
 class VFM:
