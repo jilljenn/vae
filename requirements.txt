@@ -1,4 +1,4 @@
-tensorflow<2
+tensorflow
 scikit-learn
 scipy
 pandas

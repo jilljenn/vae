@@ -1,0 +1,8 @@
+tensorflow==1.15.5
+protobuf==3.19
+tensorflow_probability==0.8
+scikit-learn
+scipy
+pandas
+PyYAML
+pywFM
