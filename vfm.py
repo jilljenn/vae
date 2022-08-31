@@ -11,6 +11,7 @@ wtfd = tfp.distributions
 import argparse
 import os.path
 import getpass
+import logging
 import pandas as pd
 import numpy as np
 import yaml
@@ -36,16 +37,18 @@ parser.add_argument('--d', type=int, nargs='?', default=3)
 parser.add_argument('--gamma', type=float, nargs='?', default=0.01)
 parser.add_argument('--sigma2', type=float, nargs='?', default=-1)
 parser.add_argument('--nb_batches', type=int, nargs='?', default=1)
+
+parser.add_argument('--v', type=int, nargs='?', default=1) # Verbose
 options = parser.parse_args()
  
 if getpass.getuser() == 'jj':
-    PATH = '/home/jj'
+    PATH = '/home/jj/code'
 else:
     PATH = '/Users/jilljenn/code'
 
 DATA = options.data
 print('Data is', DATA)
-VERBOSE = 1
+VERBOSE = options.v
 NB_SAMPLES = 1
 COMPUTE_TEST_EVERY = 1
 
@@ -102,8 +105,13 @@ else:
 nb_skills = X_fm.shape[1] - nb_users - nb_items
 
 i = {}
-i['trainval'], i['test'] = train_test_split(list(range(nb_entries)), test_size=0.2)
-i['train'], i['valid'] = train_test_split(i['trainval'], test_size=0.2)
+try:
+    i['trainval'] = pd.read_csv(os.path.join(PATH, 'vae/data', DATA, 'trainval.csv'))['index'].tolist()
+    i['test'] = pd.read_csv(os.path.join(PATH, 'vae/data', DATA, 'test.csv'))['index'].tolist()
+except Exception as e:
+    logging.warning('No trainval test %s %s', repr(e), str(e))
+    i['trainval'], i['test'] = train_test_split(list(range(nb_entries)), test_size=0.2, shuffle=True)
+i['train'], i['valid'] = train_test_split(i['trainval'], test_size=0.2, shuffle=True)
 data = {key: df.iloc[i[key]] for key in {'train', 'valid', 'trainval', 'test'}}
 
 X = {}
@@ -142,22 +150,48 @@ gamma = options.gamma  # gamma 0.001 works better for classification
 
 dt = time.time()
 
+alpha = tf.get_variable(
+    'alpha', shape=[], initializer=tf.random_uniform_initializer(minval=0., maxval=1.), constraint=tf.math.abs)
+# alpha = tf.constant(options.sigma2)
+
+emb_user_mu = tf.get_variable('emb_user_mu', shape=[embedding_size], initializer=tf.truncated_normal_initializer(stddev=0.1))
+emb_user_lambda = tf.get_variable(
+    'emb_user_lambda', shape=[embedding_size], initializer=tf.random_uniform_initializer(minval=0., maxval=1.), constraint=tf.math.abs)
+emb_item_mu = tf.get_variable('emb_item_mu', shape=[embedding_size], initializer=tf.truncated_normal_initializer(stddev=0.1))
+emb_item_lambda = tf.get_variable(
+    'emb_item_lambda', shape=[embedding_size], initializer=tf.random_uniform_initializer(minval=0., maxval=1.), constraint=tf.math.abs)
+
+bias_user_mu = tf.get_variable('bias_user_mu', shape=[], initializer=tf.truncated_normal_initializer(stddev=0.1))
+bias_user_lambda = tf.get_variable(
+    'bias_user_lambda', shape=[], initializer=tf.random_uniform_initializer(minval=0., maxval=1.), constraint=tf.math.abs)
+bias_item_mu = tf.get_variable('bias_item_mu', shape=[], initializer=tf.truncated_normal_initializer(stddev=0.1))
+bias_item_lambda = tf.get_variable(
+    'bias_item_lambda', shape=[], initializer=tf.random_uniform_initializer(minval=0., maxval=1.), constraint=tf.math.abs)
+# OVBFM does not consider mu
+'''emb_user_mu = tf.constant([0.] * embedding_size)
+emb_item_mu = tf.constant([0.] * embedding_size)
+bias_user_mu = tf.constant(0.)
+bias_item_mu = tf.constant(0.)'''
+
 global_bias = tf.get_variable('global_bias', shape=[], initializer=tf.truncated_normal_initializer(stddev=0.1))
 entity = tf.get_variable('entities', shape=[nb_users + nb_items + nb_skills, 2 * embedding_size], initializer=tf.truncated_normal_initializer(stddev=0.1))
 bias = tf.get_variable('bias', shape=[nb_users + nb_items + nb_skills, 2], initializer=tf.truncated_normal_initializer(stddev=0.1))
 all_entities = tf.constant(np.arange(nb_users + nb_items + nb_skills))
 
-def make_mu():
-    return tfd.Normal(loc=0., scale=1.)
+def make_mu_bias(lambda_):
+    return wtfd.Normal(loc=0., scale=1. / tf.sqrt(lambda_))
+
+def make_mu(lambda_):
+    return wtfd.MultivariateNormalDiag(loc=0., scale_diag=1. / tf.sqrt(lambda_))
 
 def make_lambda():
-    return tfd.Beta(1., 1.)
+    return wtfd.Gamma(1., 1.)
 
 def make_embedding_prior():
     return wtfd.MultivariateNormalDiag(loc=[0.] * embedding_size, scale_diag=[1.] * embedding_size, name='emb_prior')
 
 def make_embedding_prior2(mu0, lambda0):
-    return wtfd.MultivariateNormalDiag(loc=[mu0] * embedding_size, scale_diag=[1 / lambda0] * embedding_size)
+    return wtfd.MultivariateNormalDiag(loc=mu0, scale_diag=1 / tf.sqrt(lambda0), name='hyperprior')
 
 def make_embedding_prior3(priors, entity_batch):
     prior_prec_entity = tf.nn.embedding_lookup(priors, entity_batch, name='priors_prec')
@@ -169,13 +203,13 @@ def make_bias_prior():
 
 def make_bias_prior2(mu0, lambda0):
     # return tfd.Normal(loc=0., scale=1.)
-    return tfd.Normal(loc=mu0, scale=1/lambda0)
+    return wtfd.Normal(loc=mu0, scale=1 / tf.sqrt(lambda0))
 
 def make_bias_prior3(priors, entity_batch):
     prior_prec_entity = tf.nn.embedding_lookup(priors, entity_batch)
-    return tfd.Normal(loc=0., scale=1/tf.sqrt(prior_prec_entity[:, 0]), name='strong_bias_prior')
+    return wtfd.Normal(loc=0., scale=1/tf.sqrt(prior_prec_entity[:, 0]), name='strong_bias_prior')
 
-def make_user_posterior(user_batch):
+def make_emb_posterior(user_batch):
     feat_users = tf.nn.embedding_lookup(entity, user_batch)
     # return tfd.Normal(loc=feat_users[:, :embedding_size], scale=feat_users[:, embedding_size:])
     if options.degenerate:
@@ -184,9 +218,10 @@ def make_user_posterior(user_batch):
         # 1/tf.sqrt(prior_prec_entity)  # More precise if more ratings
         # tf.ones(embedding_size)  # Too imprecise
         std_devs = tf.nn.softplus(feat_users[:, :embedding_size])
+        # std_devs = tf.nn.relu(feat_users[:, :embedding_size])  # Non differentiable
     return wtfd.MultivariateNormalDiag(loc=feat_users[:, embedding_size:], scale_diag=std_devs, name='emb_posterior')
 
-def make_entity_bias(entity_batch):
+def make_bias_posterior(entity_batch):
     bias_batch = tf.nn.embedding_lookup(bias, entity_batch)
     if options.degenerate:
         std_dev = 0.
@@ -194,7 +229,7 @@ def make_entity_bias(entity_batch):
         # 1/tf.sqrt(prior_prec_entity[:, 0])  # More precise if more ratings, should be clipped
         # 1.  # Too imprecise
         std_dev = tf.nn.softplus(bias_batch[:, 1])
-    return tfd.Normal(loc=bias_batch[:, 0], scale=std_dev, name='bias_posterior')
+    return wtfd.Normal(loc=bias_batch[:, 0], scale=std_dev, name='bias_posterior')
 
 # def make_item_posterior(item_batch):
 #     items = tf.get_variable('items', shape=[nb_items, 2 * embedding_size])
@@ -206,20 +241,33 @@ item_batch = tf.placeholder(tf.int32, shape=[None], name='item_batch')
 X_fm_batch = tf.sparse_placeholder(tf.float32, shape=[None, nb_users + nb_items + nb_skills], name='sparse_batch')
 outcomes = tf.placeholder(tf.float32, shape=[None], name='outcomes')
 
-# mu0 = make_mu().sample()
-# lambda0 = make_lambda().sample()
+emb_user_mu0 = make_mu(emb_user_lambda)  # libFM: \mu_\pi1^v ~ N(0, 1 / \lambda_\pi1^v)
+emb_item_mu0 = make_mu(emb_item_lambda)  # libFM: \mu_\pi2^v ~ N(0, 1 / \lambda_\pi2^v)
+bias_user_mu0 = make_mu_bias(bias_user_lambda)  # libFM: \mu_\pi1^w ~ N(0, 1 / \lambda_\pi1^w)
+bias_item_mu0 = make_mu_bias(bias_item_lambda)  # libFM: \mu_\pi2^w ~ N(0, 1 / \lambda_\pi2^w)
 
-# emb_user_prior = make_embedding_prior2(mu0, lambda0)
-# emb_item_prior = make_embedding_prior2(mu0, lambda0)
-# bias_user_prior = make_bias_prior2(mu0, lambda0)
-# bias_item_prior = make_bias_prior2(mu0, lambda0)
+precision_prior = make_lambda()  # libFM: \lambda_* ~ Gamma(\alpha_\lambda, \beta_\lambda) = Gamma(1, 1)
+global_bias_prior = make_bias_prior()  # w_0 ~ N(\mu_0, \lambda_0) = N(0, 1)
+emb_user_prior = make_embedding_prior2(emb_user_mu, emb_user_lambda)  # v_j ~ N(\mu_\pi1^v, 1 / \lambda_\pi1^v)
+emb_item_prior = make_embedding_prior2(emb_item_mu, emb_item_lambda)  # v_j ~ N(\mu_\pi2^v, 1 / \lambda_\pi2^v)
+bias_user_prior = make_bias_prior2(bias_user_mu, bias_user_lambda)  # w_j ~ N(\mu_\pi1^v, 1 / \lambda_\pi1^v)
+bias_item_prior = make_bias_prior2(bias_item_mu, bias_item_lambda)  # w_j ~ N(\mu_\pi2^v, 1 / \lambda_\pi2^v)
 
-q_user = make_user_posterior(user_batch)
-q_item = make_user_posterior(item_batch)
-q_user_bias = make_entity_bias(user_batch)
-q_item_bias = make_entity_bias(item_batch)
-q_entity = make_user_posterior(all_entities)
-q_entity_bias = make_entity_bias(all_entities)
+uniq_user_batch, _ = tf.unique(user_batch)
+uniq_item_batch, _ = tf.unique(item_batch)
+
+q_uniq_user = make_emb_posterior(uniq_user_batch)  # q(v_j) = N(\mu_j^v, 1 / \lambda_j^v)
+q_uniq_item = make_emb_posterior(uniq_item_batch)
+q_uniq_user_bias = make_bias_posterior(uniq_user_batch)  # q(w_j) = N(\mu_j^w, 1 / \lambda_j^w)
+q_uniq_item_bias = make_bias_posterior(uniq_item_batch)
+
+q_user = make_emb_posterior(user_batch)  # q(v_j) = N(\mu_j^v, 1 / \lambda_j^v)
+q_item = make_emb_posterior(item_batch)
+q_user_bias = make_bias_posterior(user_batch)  # q(w_j) = N(\mu_j^w, 1 / \lambda_j^w)
+q_item_bias = make_bias_posterior(item_batch)
+
+q_entity = make_emb_posterior(all_entities)  # For sparse
+q_entity_bias = make_bias_posterior(all_entities)
 all_bias = q_entity_bias.sample(NB_SAMPLES)
 all_feat = q_entity.sample(NB_SAMPLES)
 
@@ -233,10 +281,23 @@ all_feat = q_entity.sample(NB_SAMPLES)
 # bias_users = bias_user_prior.sample(tf.shape(user_batch)[0])
 # bias_items = bias_item_prior.sample()
 
-feat_users = q_user.sample()
-feat_items = q_item.sample()
-bias_users = q_user_bias.sample()
-bias_items = q_item_bias.sample()
+N_SAMPLES = 10
+if N_SAMPLES:
+    feat_users = q_user.sample(N_SAMPLES)
+    feat_items = q_item.sample(N_SAMPLES)
+    bias_users = q_user_bias.sample(N_SAMPLES)
+    bias_items = q_item_bias.sample(N_SAMPLES)
+else:
+    feat_users = q_user.sample()
+    feat_items = q_item.sample()
+    bias_users = q_user_bias.sample()
+    bias_items = q_item_bias.sample()    
+print(feat_users.shape)
+
+mean_feat_users = q_user.mean()
+mean_feat_items = q_item.mean()
+mean_bias_users = q_user_bias.sample()
+mean_bias_items = q_item_bias.sample()
 
 # Predictions
 def make_likelihood(feat_users, feat_items, bias_users, bias_items):
@@ -244,8 +305,9 @@ def make_likelihood(feat_users, feat_items, bias_users, bias_items):
     return tfd.Bernoulli(logits)
 
 def make_likelihood_reg(sigma2, feat_users, feat_items, bias_users, bias_items):
-    logits = global_bias + tf.reduce_sum(feat_users * feat_items, 1) + bias_users + bias_items
-    return tfd.Normal(logits, scale=sigma2, name='pred')
+    logits = global_bias + tf.reduce_sum(feat_users * feat_items, 2) + bias_users + bias_items
+    # logits = global_bias + tf.diag(feat_users @ tf.transpose(feat_items)) + bias_users + bias_items
+    return tfd.Normal(logits, scale=1 / tf.sqrt(alpha), name='pred')
 
 def make_sparse_pred(x):
     #x = tf.cast(x, tf.float32)
@@ -276,6 +338,7 @@ def make_sparse_pred_reg(sigma2, x):
     return tfd.Normal(logits, scale=sigma2)
 
 def define_variables(train_category, priors, sigma2, batch_size):
+    global emb_user_prior, emb_item_prior, bias_user_prior, bias_item_prior
     if options.degenerate:
         emb_user_prior = make_embedding_prior()
         emb_item_prior = make_embedding_prior()
@@ -284,15 +347,17 @@ def define_variables(train_category, priors, sigma2, batch_size):
         bias_item_prior = make_bias_prior()
         bias_entity_prior = make_bias_prior()
     else:
-        emb_user_prior = make_embedding_prior3(priors, user_batch)
-        emb_item_prior = make_embedding_prior3(priors, item_batch)
+        # emb_user_prior = make_embedding_prior3(priors, user_batch)
+        # emb_item_prior = make_embedding_prior3(priors, item_batch)
         emb_entity_prior = make_embedding_prior3(priors, all_entities)
-        bias_user_prior = make_bias_prior3(priors, user_batch)
-        bias_item_prior = make_bias_prior3(priors, item_batch)
+        # bias_user_prior = make_bias_prior3(priors, user_batch)
+        # bias_item_prior = make_bias_prior3(priors, item_batch)
         bias_entity_prior = make_bias_prior3(priors, all_entities)
 
     user_rescale = tf.nn.embedding_lookup(priors, user_batch)[:, 0]
     item_rescale = tf.nn.embedding_lookup(priors, item_batch)[:, 0]
+    uniq_user_rescale = tf.nn.embedding_lookup(priors, uniq_user_batch)[:, 0]
+    uniq_item_rescale = tf.nn.embedding_lookup(priors, uniq_item_batch)[:, 0]
     entity_rescale = priors[:, 0]
 
     if is_classification:
@@ -303,7 +368,11 @@ def define_variables(train_category, priors, sigma2, batch_size):
         sparse_pred = make_sparse_pred_reg(sigma2, X_fm_batch)
     pred2 = sparse_pred.mean()
     # ll = make_likelihood(feat_users2, feat_items2, bias_users2, bias_items2)
-    pred = likelihood.mean()
+    pred = tf.reduce_mean(likelihood.mean(), axis=0)  # À cause du nombre de samples
+    pred_mean = global_bias + tf.reduce_sum(mean_feat_users * mean_feat_items, 1) + mean_bias_users + mean_bias_items
+    pred = pred_mean
+
+    # likelihood_var = make_likelihood_reg(sigma2, q_user, q_item, q_user_bias, q_item_bias)
     # print(likelihood.log_prob([1, 0]))
 
     # Check shapes
@@ -331,10 +400,15 @@ def define_variables(train_category, priors, sigma2, batch_size):
         # elbo = -(tf.reduce_sum((pred - outcomes) ** 2 / 2) +
         #          0.1 * tf.reduce_sum(tf.nn.l2_loss(bias_users) + tf.nn.l2_loss(bias_items) +
         #          tf.nn.l2_loss(feat_users) + tf.nn.l2_loss(feat_items)))
-        elbo = tf.reduce_mean(
-            likelihood.log_prob(outcomes) +
-            1 / user_rescale * (bias_user_prior.log_prob(bias_users) + emb_user_prior.log_prob(feat_users)) +
-            1 / item_rescale * (bias_item_prior.log_prob(bias_items) + emb_user_prior.log_prob(feat_items)), name='elbo')
+        elbo = tf.reduce_mean()
+        '''likelihood.log_prob(outcomes) - # - car KL
+                # bias_user_prior.log_prob(bias_users) + emb_user_prior.log_prob(feat_users)
+                1 / user_rescale * (wtfd.kl_divergence(q_user, emb_user_prior) +
+                                    emb_user_mu0.log_prob(emb_user_mu) + precision_prior.log_prob(emb_user_lambda) +
+                                    bias_user_mu0.log_prob(bias_user_mu) + precision_prior.log_prob(bias_user_lambda)) +
+                1 / item_rescale * (bias_item_prior.log_prob(bias_items) + emb_item_prior.log_prob(feat_items) +
+                                    emb_item_mu0.log_prob(emb_item_mu) + precision_prior.log_prob(emb_item_lambda) +
+                                    bias_item_mu0.log_prob(bias_item_mu) + precision_prior.log_prob(bias_item_lambda)), name='elbo')'''
     # / 2 : 1.27
     # * 2 : 1.16
     elif options.sparse:
@@ -365,25 +439,82 @@ def define_variables(train_category, priors, sigma2, batch_size):
         #     nb_samples[train_category] * 1 / item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
         #                       emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo')
 
-        elbo = tf.reduce_mean(likelihood.log_prob(outcomes) +
-                              1 / user_rescale * (bias_user_prior.log_prob(bias_users) - q_user_bias.log_prob(bias_users) +
-                                                  emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users)) +
-                              1 / item_rescale * (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
-                                                  emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)))
+        tmp = emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users)
+
+        print('l', likelihood)
+        print('pred', pred.shape)
+
+        print('sample unique', q_uniq_user.sample())
+        print('sample', q_user.sample())
+        print('2 samples unique', q_uniq_user.sample(2))
+        print('2 samples', q_user.sample(2))
+
+        print('l outcomes', likelihood.log_prob(outcomes).shape)
+        print('kl', wtfd.kl_divergence(q_uniq_user, emb_user_prior).shape)
+        print('all kl', wtfd.kl_divergence(q_uniq_user_bias, bias_user_prior) +
+                            wtfd.kl_divergence(q_uniq_user, emb_user_prior) +
+                            wtfd.kl_divergence(q_uniq_item_bias, bias_item_prior) +
+                            wtfd.kl_divergence(q_uniq_item, emb_item_prior))
+        print('mu_lambda', emb_user_mu0.log_prob(emb_user_mu).shape)
+
+        ''' - tf.reduce_sum(wtfd.kl_divergence(q_uniq_user_bias, bias_user_prior) +
+                            wtfd.kl_divergence(q_uniq_user, emb_user_prior)) +
+            - tf.reduce_sum(wtfd.kl_divergence(q_uniq_item_bias, bias_item_prior) +
+                            wtfd.kl_divergence(q_uniq_item, emb_item_prior))'''
+
+        # Objective function ELBO
+        elbo = (
+            tf.reduce_mean(
+                likelihood.log_prob(outcomes)
+            ) -
+            tf.reduce_mean(
+                1 / uniq_user_rescale * (wtfd.kl_divergence(q_uniq_user_bias, bias_user_prior) +
+                                    wtfd.kl_divergence(q_uniq_user, emb_user_prior))
+            ) -
+            tf.reduce_mean(
+                1 / uniq_item_rescale * (wtfd.kl_divergence(q_uniq_item_bias, bias_item_prior) +
+                                    wtfd.kl_divergence(q_uniq_item, emb_item_prior))
+            ) + (
+                global_bias_prior.log_prob(global_bias)
+                + emb_user_mu0.log_prob(emb_user_mu) + tf.reduce_sum(precision_prior.log_prob(emb_user_lambda))
+                + emb_item_mu0.log_prob(emb_item_mu) + tf.reduce_sum(precision_prior.log_prob(emb_item_lambda))
+                + bias_user_mu0.log_prob(bias_user_mu) + precision_prior.log_prob(bias_user_lambda)
+                + bias_item_mu0.log_prob(bias_item_mu) + precision_prior.log_prob(bias_item_lambda)
+                + precision_prior.log_prob(alpha)
+            ) / nb_samples['train']
+        )   
+
+        # many_feats = q_user.sample(100)
 
     sentinel = {
         'nb outcomes': tf.shape(outcomes),
         'nb samples': tf.constant(nb_samples[train_category]),
         'users': entity[:5, 0],
+        'bias_user_mu': bias_user_mu,
+        # 'user_batch': len(user_batch),
+        # 'user unique batch': len(tf.unique(user_batch)),
+        # 'nb_occ': nb_occ,
+        # 'p - q': emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users),
+        # 'many p - q': tf.reduce_mean(emb_user_prior.log_prob(many_feats) - q_user.log_prob(many_feats), axis=0),
+        # 'kl attendu': -wtfd.kl_divergence(q_user, emb_user_prior),
+        # 'kl attendu aussi': -wtfd.kl_divergence(q_user_bias, bias_user_prior),
         # 'lplq': relevant_scaled_lp_lq,
-        # 'll log prob': -likelihood.log_prob(outcomes),
+        # 'batch ll log prob': nb_samples['train'] * tf.reduce_mean(likelihood.log_prob(outcomes)),
+        # 'll log prob shape': tf.shape(likelihood.log_prob(outcomes)),
+        # 'user_rescale shape': tf.shape(user_rescale),
+        # 'batch p - q emb user': tf.reduce_sum(1 / user_rescale * tmp),
+        # 'p - q emb user shape': tf.shape(tmp),
+        # 'prec bias user lambda': precision_prior.log_prob(bias_user_lambda),
+        # 'prec bias user lambda shape': tf.shape(precision_prior.log_prob(bias_user_lambda)),
+        # 'prec emb user lambda': precision_prior.log_prob(emb_user_lambda),
+        # 'prec emb user lambda shape': tf.shape(precision_prior.log_prob(emb_user_lambda)),
         # 'll log prob sparse': -sparse_pred.log_prob(outcomes),
-        'll log prob has nan': tf.reduce_any(tf.is_nan(likelihood.log_prob(outcomes))),
-        'll log prob sparse has nan': tf.reduce_any(tf.is_nan(sparse_pred.log_prob(outcomes))),
+        # 'll log prob has nan': tf.reduce_any(tf.is_nan(likelihood.log_prob(outcomes))),
+        # 'll log prob sparse has nan': tf.reduce_any(tf.is_nan(sparse_pred.log_prob(outcomes))),
         # 's ll log prob': -tf.reduce_sum(likelihood.log_prob(outcomes)),
         # 's pred delta': tf.reduce_sum((pred - outcomes) ** 2 / 2 + np.log(2 * np.pi) / 2),
-        'entity_rescale sum': tf.reduce_sum(entity_rescale),
-        'nb occ sum': tf.constant(nb_occurrences[train_category].sum()),
+        # 'entity_rescale sum': tf.reduce_sum(entity_rescale),
+        # 'nb occ sum': tf.constant(nb_occurrences[train_category].sum()),
         # 'logits': logits,
         # 'max logits': tf.reduce_max(logits),
         # 'min logits': tf.reduce_min(logits),
@@ -392,13 +523,17 @@ def define_variables(train_category, priors, sigma2, batch_size):
         # 'bias sample': bias_users[0],
         # 'bias log prob': -bias_user_prior.log_prob(bias_users)[0],
         # 'sum bias log prob': -tf.reduce_sum(bias_user_prior.log_prob(bias_users)),
-        'pred': pred,
-        'pred2': pred2,
+        'likelihood (outcomes)': tf.shape(likelihood.log_prob(outcomes)),
+        # 'pred': pred,
+        'pred shape': tf.shape(pred),
+        # 'mean pred': pred_mean,
+        'mean pred shape': tf.shape(pred_mean),
+        # 'pred2': pred2,
         'max pred': tf.reduce_max(pred),
         'min pred': tf.reduce_min(pred),
-        'max pred2': tf.reduce_max(pred2),
-        'min pred2': tf.reduce_min(pred2),
-        'has nan': tf.reduce_any(tf.is_nan(pred2))
+        # 'max pred2': tf.reduce_max(pred2),
+        # 'min pred2': tf.reduce_min(pred2),
+        # 'has nan': tf.reduce_any(tf.is_nan(pred2))
         # 'bias mean': bias_user_prior.mean(),
         # 'bias delta': bias_users[0] ** 2 / 2 + np.log(2 * np.pi) / 2,
         # 'sum bias delta': tf.reduce_sum(bias_users ** 2 / 2 + np.log(2 * np.pi) / 2)
@@ -424,13 +559,16 @@ def define_variables(train_category, priors, sigma2, batch_size):
 #                       emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo2')
 
 optimizer = tf.train.AdamOptimizer(gamma)  # 0.001
+# optimizer = tf.train.GradientDescentOptimizer(gamma)  # 0.001
+# optimizer = tf.train.MomentumOptimizer(gamma, momentum=0.9)  # 0.001
+# optimizer = tf.train.RMSPropOptimizer(gamma)
 
 
 def make_feed(category):
     return {user_batch: X[category][:, 0],
             item_batch: X[category][:, 1],
-            outcomes: y[category],
-            X_fm_batch: X_sp[category]}
+            outcomes: y[category]}#,
+            # X_fm_batch: X_sp[category]}
 
 
 class VFM:
@@ -542,6 +680,7 @@ class VFM:
                     values = sess.run([sentinel[key] for key in sentinel], feed_dict=make_feed('batch'))
                     for key, val in zip(sentinel, values):
                         print(key, val)
+                    # sys.exit(0)
 
                 train_elbos.append(train_elbo)
                 if nb_iter == 0:
