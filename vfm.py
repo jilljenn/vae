@@ -48,11 +48,11 @@ parser.add_argument('--single_user', type=bool, nargs='?', const=True, default=F
 parser.add_argument('--split_valid', type=bool, nargs='?', const=True, default=False)
 
 parser.add_argument('--valid_patience', type=int, nargs='?', default=10)
-parser.add_argument('--train_patience', type=int, nargs='?', default=10)  # 4
+parser.add_argument('--train_patience', type=int, nargs='?', default=4)
 parser.add_argument('--d', type=int, nargs='?', default=3)
-parser.add_argument('--gamma', type=float, nargs='?', default=0.01)
+parser.add_argument('--lr', type=float, nargs='?', default=0.01)
 parser.add_argument('--nb_batches', type=int, nargs='?', default=1)
-parser.add_argument('--epochs', type=int, nargs='?', default=50)
+parser.add_argument('--epochs', type=int, nargs='?', default=200)
 parser.add_argument('--method', type=str, nargs='?', default='adam')
 parser.add_argument('--link', type=str, nargs='?', default='softplus')
 
@@ -64,15 +64,15 @@ DATA = options.data
 DATA_PATH = Path('data') / DATA
 logging.warning('Data is %s', DATA)
 VERBOSE = options.v
-NB_VARIATIONAL_SAMPLES = 1000
+NB_VARIATIONAL_SAMPLES = 100
 COMPUTE_TEST_EVERY = 5
 # Config
 MAX_EPOCHS = options.epochs
 embedding_size = options.d
 nb_iters = options.nb_batches
-gamma = options.gamma  # gamma 0.001 works better for classification
+learning_rate = options.lr  # learning_rate 0.001 works better for classification
 if options.classification:
-    gamma = 0.1
+    learning_rate = 0.1
 link = tf.nn.softplus if options.link == 'softplus' else tf.math.abs
 
 
@@ -212,7 +212,7 @@ np_link = softplus if options.link == 'softplus' else np.abs
 
 initializers = defaultdict(lambda: tf.truncated_normal_initializer(stddev=0.1))
 if options.load:
-    with open(DATA_PATH / 'saved_folds_weights.pickle', 'rb') as f:
+    with open(DATA_PATH / f'saved_folds_weights_{options.d}.pickle', 'rb') as f:
         data = pickle.load(f)
     i = data['folds']  # Override folds
     for var_name in data:
@@ -467,6 +467,8 @@ def define_variables(train_category, priors, batch_size, var_list=None):
     pred_mean = global_bias + tf.reduce_sum(mean_feat_users * mean_feat_items, 1) + mean_bias_users + mean_bias_items
     if is_classification:
         pred_mean = tf.sigmoid(pred_mean)
+    else:
+        pred = tf.clip_by_value(pred, 1, 5)
     # pred_mean = pred in regression but not in classification
 
     # likelihood_var = make_likelihood_reg(sigma2, q_user, q_item, q_user_bias, q_item_bias)
@@ -634,7 +636,7 @@ def define_variables(train_category, priors, batch_size, var_list=None):
 #                      (bias_item_prior.log_prob(bias_items) - q_item_bias.log_prob(bias_items) +
 #                       emb_user_prior.log_prob(feat_items) - q_item.log_prob(feat_items)), name='elbo2')
 
-optimizer = tf.train.AdamOptimizer(gamma)  # 0.001
+optimizer = tf.train.AdamOptimizer(learning_rate)  # 0.001
 # optimizer = tf.train.GradientDescentOptimizer(gamma)  # 0.001
 # optimizer = tf.train.MomentumOptimizer(gamma, momentum=0.9)  # 0.001
 # optimizer = tf.train.RMSPropOptimizer(gamma)
@@ -682,7 +684,7 @@ class VFM:
             'train': defaultdict(list),
             'valid': defaultdict(list),
             'test': defaultdict(list),
-            # 'after': defaultdict(list),
+            '': defaultdict(list),
             'random': defaultdict(list),
             'mean': defaultdict(list),
             'variance': defaultdict(list),
@@ -698,8 +700,8 @@ class VFM:
 
     def reset(self, strategy='random'):
         self.strategy = strategy
-        self.metrics['train'] = defaultdict(list)
-        self.metrics['test'] = defaultdict(list)
+        # self.metrics['train'] = defaultdict(list)
+        # self.metrics['test'] = defaultdict(list)
         i[self.data['train']] = []  # Reset training set
         update_vars(self.data['train'])
 
@@ -710,8 +712,8 @@ class VFM:
             title = 'vfm-sparse'
         else:
             title = 'vfm'
-        name = '{:s}-{:s}-{:s}-{:s}'.format(DATA, title, self.data['train'],
-                                            self.strategy)
+        name = '{:s}-{:s}-{:s}-{:s}-{:d}'.format(
+            DATA, title, self.data['train'], self.strategy, options.d)
         if SUFFIX:
             name += '-' + SUFFIX
         return name
@@ -721,7 +723,7 @@ class VFM:
         '''for key, value in state.items():
                                     logging.warning('hiya %s %s', key, type(value))'''
         del state['start_time']
-        del state['pred']
+        del state['pred'], state['elbo'], state['likelihood'], state['infer_op']
         return state
 
     def save_model(self):
@@ -734,7 +736,7 @@ class VFM:
             data[var.name] = val
             # logging.warning('%s %s %s', var.name, val.shape, val)  # Prints the name of the variable alongside its value.
 
-        with open(DATA_PATH / 'saved_folds_weights.pickle', 'wb') as f:
+        with open(DATA_PATH / f'saved_folds_weights_{options.d}.pickle', 'wb') as f:
             pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         with open(DATA_PATH / 'vfm.pickle', 'wb') as f:
@@ -835,21 +837,16 @@ class VFM:
         df_unasked['proba_means'], df_unasked['logit_variances'] = (
             self.predict_proba(remaining_dict))
         df_unasked['certainty'] = abs(df_unasked['proba_means'] - 0.5)    
-        # print(df_unasked)
+        df_unasked['random'] = np.random.random(size=(len(unasked),))
 
         if strategy == 'random':
-            sample_ids = random.sample(unasked, nb_questions)
-            print(sample_ids)
-            i[self.data['train']].extend(sample_ids)
+            selection = df_unasked.sort_values('random').groupby('user').first()
         elif strategy == 'mean':
             selection = df_unasked.sort_values('certainty').groupby('user').first()
-            # print('omg', selection)
-            i[self.data['train']].extend(selection['index'])
         elif strategy == 'variance':
             selection = df_unasked.sort_values(
                 'logit_variances', ascending=False).groupby('user').first()
-            # print('omg', selection)
-            i[self.data['train']].extend(selection['index'])
+        i[self.data['train']].extend(selection['index'])    
         '''logging.warning('dataset is now %s %s', i[self.data['train']],
                                                 X[self.data['train']])'''
         update_vars(self.data['train'])
@@ -863,7 +860,7 @@ class VFM:
         '''plt.clf()
                                 plt.hist(logits[:, 0], bins=50)
                                 plt.savefig('q1.png')'''
-        print(feed_dict)
+        # print(feed_dict)
         return proba_means, logit_variances
 
     def init_train(self, training_set_name=None):
@@ -892,12 +889,14 @@ class VFM:
         self.init_train(training_set_name)
 
         self.epoch = 0
-        self.metrics['test'] = defaultdict(list)  # Flush test metrics
+        self.metrics['train'] = defaultdict(list)  # Flush metrics
+        self.metrics['test'] = defaultdict(list)
 
         logging.warning('Test initial performance')
         self.run_and_save('test')
 
-        self.predict_proba()
+        if is_classification:
+            self.predict_proba()
 
         while True:
             self.epoch += 1
@@ -956,22 +955,26 @@ class VFM:
 
         print('Stop training: {:s} {:s} is {:s}'.format(self.category_watcher, self.metric_watcher, str(watched_values)))
 
-        _, logit_variances = self.predict_proba()
+        logit_variances = None
+        if is_classification:
+            _, logit_variances = self.predict_proba()
 
         logging.warning('Test contains %d samples', nb_samples[self.data['test']])
-        self.metrics[self.strategy]['nb_train_samples'].append(nb_samples[self.data['train']])
-        self.metrics[self.strategy]['test mean variance'].append(logit_variances.mean())
+        self.metrics[self.strategy]['nb_train_samples'].append(int(nb_samples[self.data['train']]))
+        if logit_variances is not None:
+            self.metrics[self.strategy]['test mean variance'].append(logit_variances.mean().astype(np.float64))
         for metric in self.metrics['test']:
             final = self.metrics['test'][metric][-1]
-            best = (np.max if metric in {'auc', 'acc', 'epoch'} else np.min)(
+            best = (max if metric in {'auc', 'acc', 'epoch'} else min)(
                 self.metrics['test'][metric])
             self.metrics['final ' + metric] = final
             self.metrics[self.strategy][metric].append(final)
             self.metrics['best ' + metric] = float(best)
             self.metrics[self.strategy]['best ' + metric].append(best)
             print('[{:s}] final={:f} best={:f}'.format(metric, final, best))
+        # sys.exit(0)
 
-        # self.save_logs()
+        self.save_logs()
         self.plot('train')
         self.plot('test')
 

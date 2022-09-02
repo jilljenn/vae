@@ -1,5 +1,6 @@
 import matplotlib.pyplot as plt
 from collections import defaultdict
+from pathlib import Path
 import pandas as pd
 import numpy as np
 import json
@@ -10,19 +11,25 @@ import os
 log_name = sys.argv[1]
 K = 5  # Strip length
 fig_name = log_name.replace('txt', 'pdf')
+fig_name_png = log_name.replace('txt', 'png')
 print(log_name)
 cv = 'trainval' not in log_name
 
+LIBFM_RESULTS_PATH = Path('../Scalable-Variational-Bayesian-Factorization-Machine/results/')
+
 als = {
-    'movie100k': 'rlog-data-movie100k-X_fm-1536156951.csv',
-    'movie1M': 'rlog-data-movie1M-X_fm-1536158156.csv'
+}
+
+ovbfm = {
+    'movie100k': LIBFM_RESULTS_PATH / 'ovbfm_100k',
+    'movie1M': LIBFM_RESULTS_PATH / 'ovbfm_1M',
+    'movie10M': LIBFM_RESULTS_PATH / 'ovbfm_10M'
 }
 
 mcmc = {
-    # 'movie100k': 'rlog-data-movie100k-X_fm-1536112221.csv',
-    'movie100k': 'rlog-data-movie100k-X_fm-1536157242.csv',
-    'movie1M': 'rlog-data-movie1M-X_fm-1536142042.csv',
-    'movie10M': 'rlog-data-movie10M-X_fm-1536149311.csv'
+    'movie100k': LIBFM_RESULTS_PATH / 'mcmc_100k',
+    'movie1M': LIBFM_RESULTS_PATH / 'mcmc_1M',
+    'movie10M': LIBFM_RESULTS_PATH / 'mcmc_10M'
 }
 
 criteria = defaultdict(lambda: defaultdict(list))
@@ -30,7 +37,7 @@ with open(log_name) as f:
     data = json.load(f)
 
 dataset = data['args']['data']
-metric_name = 'auc' if dataset == 'fraction' else 'rmse'
+metric_name = 'auc' if dataset in {'fraction', 'movie5', 'movie20'} else 'rmse'
 
 train_epochs = np.unique(sorted(data['metrics']['train']['epoch']))
 print('Train', min(train_epochs), max(train_epochs))
@@ -78,7 +85,8 @@ else:
 if metric_name in data['metrics']['train']:
     metric.plot(train_epochs, data['metrics']['train'][metric_name], label='train {:s}'.format(metric_name))
 metric.plot(data['metrics']['test']['epoch'], data['metrics']['test'][metric_name], label='VFM')
-MAX_EPOCH = max(data['metrics']['test']['epoch'])
+MAX_EPOCH = 400 # max(data['metrics']['test']['epoch'])
+# 200 # 
 
 if cv:
     elbo.plot(train_epochs, data['metrics']['train']['elbo'], label='train elbo')
@@ -96,8 +104,12 @@ if cv:
     progress_graph.set_title('Progress of ELBO')
 else:
     if dataset in mcmc:
-        df = pd.read_csv(mcmc[dataset])
+        df = pd.read_csv(mcmc[dataset], sep='\t')
         metric.plot(1 + df.index[:MAX_EPOCH], df['rmse'][:MAX_EPOCH], label='libFM MCMC')
+
+    if dataset in ovbfm:
+        df = pd.read_csv(ovbfm[dataset], sep='\t')
+        metric.plot(1 + df.index[:MAX_EPOCH], df['rmse_mcmc_this'][:MAX_EPOCH], label='OVBFM')
 
     if dataset in als:
         df = pd.read_csv(als[dataset])
@@ -106,7 +118,8 @@ else:
 metric.set_title('Test {:s} ↓ over epochs'.format(metric_name.upper()))
 metric.legend()
 if metric_name == 'rmse':
-    metric.set_ylim(ymax=2)
+    metric.set_ylim(ymax=1.2)
 # fig.legend()
+fig.savefig('{:s}'.format(fig_name_png, format='png'))
 fig.savefig('{:s}'.format(fig_name, format='pdf'))
 os.system('open {:s}'.format(fig_name))
