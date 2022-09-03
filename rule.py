@@ -27,6 +27,8 @@ ovbfm = {
 }
 
 mcmc = {
+    'movie100': LIBFM_RESULTS_PATH / 'mcmc_100',
+    'movie1000': LIBFM_RESULTS_PATH / 'mcmc_1000',
     'movie100k': LIBFM_RESULTS_PATH / 'mcmc_100k',
     'movie1M': LIBFM_RESULTS_PATH / 'mcmc_1M',
     'movie10M': LIBFM_RESULTS_PATH / 'mcmc_10M'
@@ -37,7 +39,7 @@ with open(log_name) as f:
     data = json.load(f)
 
 dataset = data['args']['data']
-metric_name = 'auc' if dataset in {'fraction', 'movie5', 'movie20'} else 'rmse'
+metric_name = 'acc' if dataset in {'fraction', 'movie5', 'movie20', 'movie100'} else 'rmse'
 
 train_epochs = np.unique(sorted(data['metrics']['train']['epoch']))
 print('Train', min(train_epochs), max(train_epochs))
@@ -85,6 +87,7 @@ else:
 if metric_name in data['metrics']['train']:
     metric.plot(train_epochs, data['metrics']['train'][metric_name], label='train {:s}'.format(metric_name))
 metric.plot(data['metrics']['test']['epoch'], data['metrics']['test'][metric_name], label='VFM')
+print('VFM', data['metrics']['test'][metric_name])
 MAX_EPOCH = 400 # max(data['metrics']['test']['epoch'])
 # 200 # 
 
@@ -105,11 +108,16 @@ if cv:
 else:
     if dataset in mcmc:
         df = pd.read_csv(mcmc[dataset], sep='\t')
-        metric.plot(1 + df.index[:MAX_EPOCH], df['rmse'][:MAX_EPOCH], label='libFM MCMC')
+        mcmc_metric_name = 'accuracy' if metric_name == 'acc' else 'rmse'
+        metric.plot(1 + df.index[:MAX_EPOCH], df[mcmc_metric_name][:MAX_EPOCH], label='libFM MCMC')
+        print('MCMC', df[mcmc_metric_name][:MAX_EPOCH])
+    else:
+        pass
 
     if dataset in ovbfm:
         df = pd.read_csv(ovbfm[dataset], sep='\t')
         metric.plot(1 + df.index[:MAX_EPOCH], df['rmse_mcmc_this'][:MAX_EPOCH], label='OVBFM')
+        print('OVBFM', df['rmse_mcmc_this'][:MAX_EPOCH])
 
     if dataset in als:
         df = pd.read_csv(als[dataset])

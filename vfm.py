@@ -1,7 +1,7 @@
 from itertools import product
 from math import sqrt
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error
+from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error, average_precision_score
 from scipy.sparse import coo_matrix, load_npz, save_npz, hstack, find
 from scipy.stats import sem, t
 import matplotlib.pyplot as plt
@@ -16,6 +16,7 @@ from pathlib import Path
 wtfd = tfp.distributions
 import argparse
 import os
+from plot import plot_after
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
 from tensorflow.python.util import deprecation
 deprecation._PRINT_DEPRECATION_WARNINGS = False
@@ -60,13 +61,15 @@ parser.add_argument('--v', type=int, nargs='?', default=1) # Verbose
 options = parser.parse_args()
 
 
+# Config
 DATA = options.data
 DATA_PATH = Path('data') / DATA
 logging.warning('Data is %s', DATA)
 VERBOSE = options.v
 NB_VARIATIONAL_SAMPLES = 100
 COMPUTE_TEST_EVERY = 5
-# Config
+N_QUESTIONS_ASKED = 20
+TRAIN_EVERY_N_QUESTIONS = 4
 MAX_EPOCHS = options.epochs
 embedding_size = options.d
 nb_iters = options.nb_batches
@@ -162,6 +165,7 @@ except Exception as e:
         users = df['userId'].unique()
         items = df['movieId'].unique()
         user_train, user_test = train_test_split(users, test_size=0.2, shuffle=True)
+        nb_users_test = len(user_test)
         if options.single_user:
             user_test = user_test[:1]
         if options.split_valid:
@@ -178,6 +182,17 @@ except Exception as e:
         i['test_y'] = df.query('userId in @user_test and movieId in @item_test').index
         for key in i:
             print(key, max(i[key]) if len(i[key]) else 0, df.shape)
+
+        OVBFM_PATH = Path('../Scalable-Variational-Bayesian-Factorization-Machine')
+        to_ovbfm = DATA
+        with open(OVBFM_PATH / 'data' / f'{to_ovbfm}.train_libfm', 'w') as f:
+            for user, item, rating in np.array(df.loc[i['trainval'], ['user', 'item', 'outcome']]):
+                f.write('{:d} {:d}:1 {:d}:1\n'.format(rating, user, item))
+
+        with open(OVBFM_PATH / 'data' / f'{to_ovbfm}.test_libfm', 'w') as f:
+            for user, item, rating in np.array(df.loc[i['test'], ['user', 'item', 'outcome']]):
+                f.write('{:d} {:d}:1 {:d}:1\n'.format(rating, user, item))
+
     else:
         i['trainval'], i['test'] = train_test_split(list(range(nb_entries)), test_size=0.2, shuffle=True)
         i['train'], i['valid'] = train_test_split(i['trainval'], test_size=0.2, shuffle=True)
@@ -215,10 +230,15 @@ if options.load:
     with open(DATA_PATH / f'saved_folds_weights_{options.d}.pickle', 'rb') as f:
         data = pickle.load(f)
     i = data['folds']  # Override folds
+    nb_users_test = data['nb_test_users']
     for var_name in data:
         if var_name != 'folds':
             # Initializing item embeddings
-            data['other_entities:0'][20:, :3] = -10.  # Kill those neurons
+            item_pos = df['item'].min()
+            data['other_entities:0'][item_pos:, :embedding_size] = -10.  # Kill those neurons
+
+            # Initializing item biases
+            data['other_entities:0'][item_pos:, 1] = -10.
             '''print(data['other_entities:0'][20:, :3].round(3))
                                                 print(np_link(data['other_entities:0'][20:, :3].round(3)))
                                                 print('checksum', np_link(data['other_entities:0'][20:, :3]).sum())
@@ -229,8 +249,11 @@ if options.load:
 
             # Initializing user embeddings
             train_user_ids = df.iloc[i['trainval']]['user'].unique()
-            test_user_ids = df.iloc[i['test']]['user'].unique()            
+            test_user_ids = df.iloc[i['test']]['user'].unique()
             data['user_entities:0'][test_user_ids] = data['user_entities:0'][train_user_ids].mean(axis=0)
+
+            # Initializing user biases
+            data['user_biases:0'][test_user_ids] = data['user_biases:0'][train_user_ids].mean(axis=0)
 
             # sys.exit(0)
             initializers[var_name.replace(':0', '')] = tf.constant_initializer(
@@ -730,7 +753,7 @@ class VFM:
         tvars = tf.trainable_variables()
         tvars_vals = sess.run(tvars)
 
-        data = {'folds': i}
+        data = {'folds': i, 'nb_test_users': nb_users_test}
         for var, val in zip(tvars, tvars_vals):
             tf.add_to_collection('vars', var)
             data[var.name] = val
@@ -770,12 +793,14 @@ class VFM:
         if epoch not in self.metrics[category]['epoch']:
             self.metrics[category]['epoch'].append(epoch)
         self.metrics[category]['acc'].append(np.mean(y_truth == np.round(y_pred)))
-        self.metrics[category]['rmse'].append(mean_squared_error(y_truth, y_pred) ** 0.5)
         if set(y_truth) == {0., 1.}:
             # from collections import Counter
             # print(Counter(y_truth))
             self.metrics[category]['auc'].append(roc_auc_score(y_truth, y_pred))
+            self.metrics[category]['map'].append(average_precision_score(y_truth, y_pred))
             self.metrics[category]['nll'].append(log_loss(y_truth, y_pred, eps=1e-6))
+        else:
+            self.metrics[category]['rmse'].append(mean_squared_error(y_truth, y_pred) ** 0.5)
         if VERBOSE:
             print('[%s] ' % category + ' '.join('{:s}={}'.format(metric, np.round(self.metrics[category][metric][-1], 3)) for metric in self.metrics[category]))
 
@@ -793,14 +818,17 @@ class VFM:
         self.metrics['model_name'] = self.model_name()
         # self.metrics['train']['elbo'] = self.metrics['train']['elbo'].astype()
         self.metrics['time']['total'] = time.time() - self.start_time
-        with open('results/{:s}'.format(filename), 'w') as f:
-            f.write(json.dumps({
-                'description': DESCRIPTION,
-                'date': datetime.now().isoformat(),
-                'stopped': '{:d}/{:d}'.format(self.epoch, MAX_EPOCHS),
-                'args': vars(options),
-                'metrics': self.metrics,
-            }, indent=4))
+        data = {
+            'description': DESCRIPTION,
+            'date': datetime.now().isoformat(),
+            'stopped': '{:d}/{:d}'.format(self.epoch, MAX_EPOCHS),
+            'args': vars(options),
+            'metrics': self.metrics,
+        }
+        save_to_path = Path('results') / filename
+        plot_after(data, save_to_path)
+        with open(save_to_path, 'w') as f:
+            f.write(json.dumps(data, indent=4))
 
     def plot(self, category):
         plt.clf()
@@ -810,23 +838,6 @@ class VFM:
                 plt.plot(x, self.metrics[category][metric], label=metric)
         plt.legend()
         plt.savefig(DATA_PATH / f'{self.model_name()}_{category}.png')
-
-    def plot_after(self):
-        plt.clf()
-        fig, axes = plt.subplots(2, 3, figsize=(21, 7))
-        for ax_id, strategy in enumerate(['random', 'mean', 'variance']):
-            axes[0, ax_id].title.set_text(strategy)
-            if strategy in self.metrics:
-                x = self.metrics[strategy]['nb_train_samples']
-                for metric in self.metrics[strategy]:
-                    if 'acc' in metric or 'auc' in metric:
-                        axes[0, ax_id].plot(x, self.metrics[strategy][metric], label=metric)
-                    elif 'var' in metric:
-                        axes[1, ax_id].plot(x, self.metrics[strategy][metric], label=metric)
-        for ip in range(2):
-            for jp in range(3):
-                axes[ip, jp].legend()
-        plt.savefig(DATA_PATH / (self.model_name().replace(self.strategy, 'strategies') + '_after.png'))
 
     def select_next_question(self, pool_name, nb_questions=1, strategy='random'):
         # For each user
@@ -960,12 +971,12 @@ class VFM:
             _, logit_variances = self.predict_proba()
 
         logging.warning('Test contains %d samples', nb_samples[self.data['test']])
-        self.metrics[self.strategy]['nb_train_samples'].append(int(nb_samples[self.data['train']]))
+        self.metrics[self.strategy]['nb_train_samples'].append(int(nb_samples[self.data['train']]) // nb_users_test)
         if logit_variances is not None:
-            self.metrics[self.strategy]['test mean variance'].append(logit_variances.mean().astype(np.float64))
+            self.metrics[self.strategy]['mean test variance'].append(logit_variances.mean().astype(np.float64))
         for metric in self.metrics['test']:
             final = self.metrics['test'][metric][-1]
-            best = (max if metric in {'auc', 'acc', 'epoch'} else min)(
+            best = (max if metric in {'auc', 'acc', 'epoch', 'map'} else min)(
                 self.metrics['test'][metric])
             self.metrics['final ' + metric] = final
             self.metrics[self.strategy][metric].append(final)
@@ -1020,11 +1031,10 @@ if __name__ == '__main__':
         for strategy in ['random', 'mean', 'variance']:
             interactive.reset(strategy=strategy)
 
-            for _ in range(10):
+            for q in range(N_QUESTIONS_ASKED):
                 interactive.select_next_question('test_x')
-                interactive.train()
-
-        interactive.plot_after()
+                if (q + 1) % TRAIN_EVERY_N_QUESTIONS == 0:
+                    interactive.train()
 
         # embeddings = sess.run(other_entities)
         # logging.warning('checksum %f', embeddings.sum())
