@@ -96,7 +96,7 @@ class CF(nn.Module):
 
 # model = CF(EMBEDDING_SIZE)
 loss_function = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-5)
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
 # optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
 losses = []
 for epoch in tqdm(range(N_EPOCHS)):
@@ -113,11 +113,11 @@ for epoch in tqdm(range(N_EPOCHS)):
         losses.append(loss.item())
 
     if epoch % DISPLAY_EPOCH_EVERY == 0:
-        print(f"Epoch {epoch}: Train MSE {np.mean(losses)}")
+        print(f"Epoch {epoch}: Train RMSE {np.mean(losses) ** 0.5}")
 
         y_pred = model(X_test).squeeze()
         loss = loss_function(y_pred, y_test)
-        print('Test MSE', loss)
+        print('Test RMSE', loss ** 0.5)
 
 
 if DATA == 'movielens':
