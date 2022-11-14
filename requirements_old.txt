@@ -1,5 +1,5 @@
 tensorflow==1.15.5
-protobuf==3.19
+protobuf==3.19.5
 tensorflow_probability==0.8
 scikit-learn
 scipy
