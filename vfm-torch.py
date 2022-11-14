@@ -10,6 +10,7 @@ import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error, average_precision_score
 import pandas as pd
+from prepare import load_data
 
 
 LEARNING_RATE = 0.1
@@ -50,6 +51,7 @@ if DATA == 'movie100':
 
     OUTPUT_TYPE = 'class'
 else:
+    X_train = None
     if DATA == 'movielens':
         N_EPOCHS = 50
         DISPLAY_EPOCH_EVERY = 2
@@ -68,22 +70,20 @@ else:
         N_EPOCHS = 50
         DISPLAY_EPOCH_EVERY = 2
         BATCH_SIZE = 800
-        df = pd.read_csv('data/movie100k/data.csv')#.head(1000)
-        if DATA.endswith('batch'):
-            N_EPOCHS = 100
-            DISPLAY_EPOCH_EVERY = 10
-            df = df.head(1000)
+        '''df = pd.read_csv('data/movie100k/data.csv')#.head(1000)
+                                if DATA.endswith('batch'):
+                                    N_EPOCHS = 100
+                                    DISPLAY_EPOCH_EVERY = 10
+                                    df = df.head(1000)'''
         # films = pd.read_csv('ml-latest-small/movies.csv')
         # df = df.merge(films, on='movieId')
-        df['user'] = np.unique(df['user'], return_inverse=True)[1]
-        df['item'] = np.unique(df['item'], return_inverse=True)[1]
-        N = df['user'].nunique()
-        M = df['item'].nunique()
-        # print(N, M, df.min(), df.max())
-        # df['user'] -= 1
-        df['item'] += N # - 1
-        X = torch.LongTensor(df[['user', 'item']].to_numpy())
-        y = torch.Tensor(df['rating'])
+
+        N, M, X_train, X_test, y_train, y_test = load_data('movie100k')
+        X_train = torch.LongTensor(X_train)
+        y_train = torch.Tensor(y_train)
+        X_test = torch.LongTensor(X_test)
+        y_test = torch.Tensor(y_test)
+
     elif DATA == 'movie100':
         N_EPOCHS = 100
         DISPLAY_EPOCH_EVERY = 5
@@ -103,8 +103,9 @@ else:
         X = torch.LongTensor(df[['user', 'item']].to_numpy())
         y = torch.LongTensor(df['outcome'])        
 
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, shuffle=True)
+    if X_train is None:
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.2, shuffle=True)
 
 train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
 test_dataset = torch.utils.data.TensorDataset(X_test, y_test)

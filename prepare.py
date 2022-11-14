@@ -7,14 +7,25 @@ import pickle
 import logging
 
 
-parser = argparse.ArgumentParser(description='Prepare data')
-parser.add_argument('data', type=str, nargs='?', default='movie100k')
-options = parser.parse_args()
+def load_data(DATA):
+    i = {}
+    DATA_PATH = Path('data') / DATA
+    df = pd.read_csv(DATA_PATH / 'data.csv')
+    df['user'] = np.unique(df['user'], return_inverse=True)[1]  # Preprocess 0..N - 1
+    df['item'] = np.unique(df['item'], return_inverse=True)[1]
+    df['shifted_item'] = df['item'] + df['user'].nunique()
+    i['trainval'] = pd.read_csv(DATA_PATH / 'trainval.csv')['index'].tolist()
+    i['test'] = pd.read_csv(DATA_PATH / 'test.csv')['index'].tolist()
+    df_trainval = df.loc[i['trainval'], ['user', 'shifted_item', 'rating']]
+    df_test = df.loc[i['test'], ['user', 'shifted_item', 'rating']]
+    X_train = df_trainval[['user', 'shifted_item']].to_numpy()
+    y_train = df_trainval['rating'].to_numpy()
+    X_test = df_test[['user', 'shifted_item']].to_numpy()
+    y_test = df_test['rating'].to_numpy()
+    return df['user'].nunique(), df['item'].nunique(), X_train, X_test, y_train, y_test
 
-DATA = options.data
-
-i = {}
-if DATA == 'movie100k':
+def prepare_data(DATA):
+    i = {}
     DATA_PATH = Path('data') / DATA
     df = pd.read_csv(DATA_PATH / 'data.csv')
     df['user'] = np.unique(df['user'], return_inverse=True)[1]  # Preprocess 0..N - 1
@@ -33,7 +44,7 @@ if DATA == 'movie100k':
                 f.write('{:d} {:d}:1 {:d}:1\n'.format(rating, user, item))
 
 
-if DATA == 'ml-latest':
+def prepare_ml_latest():
     df = pd.read_csv('ml-latest-small/ratings.csv')
     # df = df.query('movieId < 1000')
     print(df.head(), len(df))
@@ -64,3 +75,16 @@ if DATA == 'ml-latest':
     with open('ml0.pickle', 'wb') as f:
         pickle.dump(data, f)
         pickle.dump(nb_items, f)
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Prepare data')
+    parser.add_argument('data', type=str, nargs='?', default='movie100k')
+    options = parser.parse_args()
+
+    DATA = options.data
+
+    if DATA == 'movie100k':
+        prepare_data(DATA)
+    elif DATA == 'ml-latest':
+        prepare_ml_latest()
