@@ -1,0 +1,6 @@
+torch
+tqdm
+tensorboard
+scikit-learn
+pandas
+matplotlib
