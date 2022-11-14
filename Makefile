@@ -18,4 +18,4 @@ clean:
 	python rule.py $<
 
 good:
-	python vfm.py movie100k --d 20 --sigma2 0.2 --nb_batches 100
+	python vfm.py movie100k --d 20 --nb_batches 100

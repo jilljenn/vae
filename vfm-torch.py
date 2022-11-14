@@ -67,7 +67,7 @@ else:
     elif DATA.startswith('movie100k'):
         N_EPOCHS = 50
         DISPLAY_EPOCH_EVERY = 2
-        BATCH_SIZE = 1000
+        BATCH_SIZE = 800
         df = pd.read_csv('data/movie100k/data.csv')#.head(1000)
         if DATA.endswith('batch'):
             N_EPOCHS = 100
@@ -120,10 +120,11 @@ class CF(nn.Module):
         super().__init__()
         self.output = output
         self.alpha = nn.Parameter(torch.Tensor([1e9]), requires_grad=True)
+        self.global_bias = nn.Parameter(torch.Tensor([0.]), requires_grad=True)
         # self.alpha = torch.Tensor([1.])
         # nn.init.uniform_(self.alpha)
-        self.bias_params = nn.Embedding(N + M, 2)
-        self.entity_params = nn.Embedding(N + M, 2 * embedding_size)
+        self.bias_params = nn.Embedding(N + M, 2)  # w
+        self.entity_params = nn.Embedding(N + M, 2 * embedding_size)  # V
         self.bias_prior = distributions.normal.Normal(
             torch.Tensor([0.]), torch.Tensor([1.]))
         self.entity_prior = distributions.multivariate_normal.MultivariateNormal(
@@ -149,18 +150,17 @@ class CF(nn.Module):
         biases = bias_sampler.rsample((N_VARIATIONAL_SAMPLES,)).reshape(
             N_VARIATIONAL_SAMPLES, -1, 2)
         entities = entity_sampler.rsample((N_VARIATIONAL_SAMPLES,)).reshape(
-            N_VARIATIONAL_SAMPLES, -1, 2, EMBEDDING_SIZE)
+            N_VARIATIONAL_SAMPLES, -1, 2, EMBEDDING_SIZE)  # N_VAR_SAMPLES x BATCH_SIZE x 2 (user, item) x EMBEDDING_SIZE
         # print('hola', biases.shape, entities.shape)
         sum_users_items_biases = biases.sum(axis=2).mean(axis=0).squeeze()
         users_items_emb = entities.prod(axis=2).sum(axis=2).mean(axis=0)
         # print('final', sum_users_items_biases.shape, users_items_emb.shape)
         std_dev = torch.sqrt(1 / nn.functional.softplus(self.alpha))
+        unscaled_pred = self.global_bias + sum_users_items_biases + users_items_emb
         if self.output == 'reg':
-            likelihood = distributions.normal.Normal(
-                sum_users_items_biases + users_items_emb, std_dev)
+            likelihood = distributions.normal.Normal(unscaled_pred, std_dev)
         else:
-            likelihood = distributions.bernoulli.Bernoulli(
-                logits=sum_users_items_biases + users_items_emb)
+            likelihood = distributions.bernoulli.Bernoulli(logits=unscaled_pred)
         return (likelihood,
             distributions.kl.kl_divergence(bias_sampler, self.bias_prior),
             distributions.kl.kl_divergence(entity_sampler, self.entity_prior))
@@ -190,7 +190,7 @@ for epoch in tqdm(range(N_EPOCHS)):
         loss.backward()
         optimizer.step()
 
-        y_pred = outputs.mean.detach().numpy()
+        y_pred = outputs.mean.detach().numpy().clip(1, 5)
         pred.extend(y_pred)
         truth.extend(target)
         losses.append(loss.item())
@@ -219,7 +219,7 @@ for epoch in tqdm(range(N_EPOCHS)):
         # print('entity max abs', model.entity_params.weight.abs().max())
 
         outputs, _, _ = model(X_test)
-        y_pred = outputs.mean.detach().numpy()
+        y_pred = outputs.mean.detach().numpy().clip(1, 5)
         print('test pred', np.round(y_pred[-5:], 4), y_test[-5:])    
         if OUTPUT_TYPE == 'reg':
             test_rmse = mean_squared_error(y_test, y_pred) ** 0.5

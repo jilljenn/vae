@@ -47,6 +47,7 @@ parser.add_argument('--classification', type=bool, nargs='?', const=True, defaul
 parser.add_argument('--load', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--single_user', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--split_valid', type=bool, nargs='?', const=True, default=False)
+parser.add_argument('--interactive', type=bool, nargs='?', const=True, default=False)
 
 parser.add_argument('--valid_patience', type=int, nargs='?', default=10)
 parser.add_argument('--train_patience', type=int, nargs='?', default=4)
@@ -54,6 +55,7 @@ parser.add_argument('--d', type=int, nargs='?', default=3)
 parser.add_argument('--lr', type=float, nargs='?', default=0.01)
 parser.add_argument('--nb_batches', type=int, nargs='?', default=1)
 parser.add_argument('--epochs', type=int, nargs='?', default=200)
+parser.add_argument('--var_samples', type=int, nargs='?', default=1)
 parser.add_argument('--method', type=str, nargs='?', default='adam')
 parser.add_argument('--link', type=str, nargs='?', default='softplus')
 
@@ -66,7 +68,7 @@ DATA = options.data
 DATA_PATH = Path('data') / DATA
 logging.warning('Data is %s', DATA)
 VERBOSE = options.v
-NB_VARIATIONAL_SAMPLES = 100
+NB_VARIATIONAL_SAMPLES = options.var_samples
 COMPUTE_TEST_EVERY = 5
 N_QUESTIONS_ASKED = 20
 TRAIN_EVERY_N_QUESTIONS = 4
@@ -158,7 +160,9 @@ i = {}
 try:
     i['trainval'] = pd.read_csv(DATA_PATH / 'trainval.csv')['index'].tolist()
     i['test'] = pd.read_csv(DATA_PATH / 'test.csv')['index'].tolist()
-    i['train'], i['valid'] = train_test_split(i['trainval'], test_size=0.2, shuffle=True)
+    nb_users_test = len(i['test'])
+    logging.warning('managed to load trainval/test')
+    # i['train'], i['valid'] = train_test_split(i['trainval'], test_size=0.2, shuffle=True)
 except Exception as e:
     logging.warning('No trainval test %s %s', repr(e), str(e))
     if DATA not in {'fraction', 'movie1M', 'movie10M', 'movie100k'}:
@@ -486,7 +490,8 @@ def define_variables(train_category, priors, batch_size, var_list=None):
         sparse_pred = make_sparse_pred_reg(X_fm_batch)
     pred2 = sparse_pred.mean()
     # ll = make_likelihood(feat_users2, feat_items2, bias_users2, bias_items2)
-    pred = tf.reduce_mean(likelihood.mean(), axis=0)  # À cause du nombre de samples
+    pred = tf.reduce_mean(likelihood.mean(), axis=0)  # À cause du nombre de variational samples
+    # pred = tf.reduce_mean(likelihood.sample(), axis=0)  # Sampling instead of mean is worse
     pred_mean = global_bias + tf.reduce_sum(mean_feat_users * mean_feat_items, 1) + mean_bias_users + mean_bias_items
     if is_classification:
         pred_mean = tf.sigmoid(pred_mean)
@@ -719,6 +724,7 @@ class VFM:
         self.optimized_vars = optimized_vars
         self.nb_batches = nb_batches
         self.strategy = ''
+        self.all_preds = []
         self.init_train()
 
     def reset(self, strategy='random'):
@@ -790,9 +796,13 @@ class VFM:
     def save_metrics(self, category, epoch, y_truth, y_pred):
         if VERBOSE:
             print('[%s] pred' % category, y_truth[:5], y_pred[:5])
-        if epoch not in self.metrics[category]['epoch']:
+        if len(self.metrics[category]['epoch']) == 0 or self.metrics[category]['epoch'][-1] != epoch:
             self.metrics[category]['epoch'].append(epoch)
+        self.all_preds.append(y_pred.tolist())
         self.metrics[category]['acc'].append(np.mean(y_truth == np.round(y_pred)))
+        mean_pred = np.array(self.all_preds).mean(axis=0)
+        # print('shape', mean_pred.shape)
+        # sys.exit(0)
         if set(y_truth) == {0., 1.}:
             # from collections import Counter
             # print(Counter(y_truth))
@@ -801,6 +811,7 @@ class VFM:
             self.metrics[category]['nll'].append(log_loss(y_truth, y_pred, eps=1e-6))
         else:
             self.metrics[category]['rmse'].append(mean_squared_error(y_truth, y_pred) ** 0.5)
+            self.metrics[category]['rmse_all'].append(mean_squared_error(y_truth, mean_pred) ** 0.5)
         if VERBOSE:
             print('[%s] ' % category + ' '.join('{:s}={}'.format(metric, np.round(self.metrics[category][metric][-1], 3)) for metric in self.metrics[category]))
 
@@ -971,7 +982,7 @@ class VFM:
             _, logit_variances = self.predict_proba()
 
         logging.warning('Test contains %d samples', nb_samples[self.data['test']])
-        self.metrics[self.strategy]['nb_train_samples'].append(int(nb_samples[self.data['train']]) // nb_users_test)
+        self.metrics[self.strategy]['nb_train_samples'].append(int(nb_samples[self.data['train']]))  #  // nb_users_test
         if logit_variances is not None:
             self.metrics[self.strategy]['mean test variance'].append(logit_variances.mean().astype(np.float64))
         for metric in self.metrics['test']:
@@ -1025,16 +1036,17 @@ if __name__ == '__main__':
         else:
             logging.warning('checksum %f', data['other_entities:0'].sum())
 
-        interactive = VFM('ongoing_test',
-            optimized_vars=[user_entities, user_biases])
+        if options.interactive:
+            interactive = VFM('ongoing_test',
+                optimized_vars=[user_entities, user_biases])
 
-        for strategy in ['random', 'mean', 'variance']:
-            interactive.reset(strategy=strategy)
+            for strategy in ['random', 'mean', 'variance']:
+                interactive.reset(strategy=strategy)
 
-            for q in range(N_QUESTIONS_ASKED):
-                interactive.select_next_question('test_x')
-                if (q + 1) % TRAIN_EVERY_N_QUESTIONS == 0:
-                    interactive.train()
+                for q in range(N_QUESTIONS_ASKED):
+                    interactive.select_next_question('test_x')
+                    if (q + 1) % TRAIN_EVERY_N_QUESTIONS == 0:
+                        interactive.train()
 
         # embeddings = sess.run(other_entities)
         # logging.warning('checksum %f', embeddings.sum())

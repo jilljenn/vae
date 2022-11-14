@@ -20,8 +20,12 @@ LIBFM_RESULTS_PATH = Path('../Scalable-Variational-Bayesian-Factorization-Machin
 als = {
 }
 
+vbfm = {
+    'movie100k': LIBFM_RESULTS_PATH / 'vbfm_100k.csv',
+}
+
 ovbfm = {
-    'movie100k': LIBFM_RESULTS_PATH / 'ovbfm_100k',
+    'movie100k': LIBFM_RESULTS_PATH / 'ovbfm_100k.csv',
     'movie1M': LIBFM_RESULTS_PATH / 'ovbfm_1M',
     'movie10M': LIBFM_RESULTS_PATH / 'ovbfm_10M'
 }
@@ -29,7 +33,7 @@ ovbfm = {
 mcmc = {
     'movie100': LIBFM_RESULTS_PATH / 'mcmc_100',
     'movie1000': LIBFM_RESULTS_PATH / 'mcmc_1000',
-    'movie100k': LIBFM_RESULTS_PATH / 'mcmc_100k',
+    'movie100k': LIBFM_RESULTS_PATH / 'mcmc_100k.csv',
     'movie1M': LIBFM_RESULTS_PATH / 'mcmc_1M',
     'movie10M': LIBFM_RESULTS_PATH / 'mcmc_10M'
 }
@@ -83,11 +87,17 @@ if cv:
     fig, ((elbo, metric), (progress_graph, criterion_graph)) = plt.subplots(2, 2, figsize=(8, 8))
 else:
     fig, metric = plt.subplots(1, 1, figsize=(4, 4))
+    metric.set_title('Test {:s} ↓ over epochs'.format(metric_name.upper()))
+    metric.set_xlabel('Epochs')
+    metric.set_ylabel(metric_name.upper())
 
 if metric_name in data['metrics']['train']:
     metric.plot(train_epochs, data['metrics']['train'][metric_name], label='train {:s}'.format(metric_name))
 metric.plot(data['metrics']['test']['epoch'], data['metrics']['test'][metric_name], label='VFM')
-print('VFM', data['metrics']['test'][metric_name])
+if 'rmse_all' in data['metrics']['test']:
+    metric.plot(data['metrics']['test']['epoch'], data['metrics']['test']['rmse_all'], label='VFM all')
+
+# print('VFM', data['metrics']['test'][metric_name])
 MAX_EPOCH = 400 # max(data['metrics']['test']['epoch'])
 # 200 # 
 
@@ -108,22 +118,27 @@ if cv:
 else:
     if dataset in mcmc:
         df = pd.read_csv(mcmc[dataset], sep='\t')
-        mcmc_metric_name = 'accuracy' if metric_name == 'acc' else 'rmse'
-        metric.plot(1 + df.index[:MAX_EPOCH], df[mcmc_metric_name][:MAX_EPOCH], label='libFM MCMC')
-        print('MCMC', df[mcmc_metric_name][:MAX_EPOCH])
-    else:
-        pass
+        mcmc_metric_names = 'accuracy' if metric_name == 'acc' else [
+            'rmse_mcmc_this', 'rmse_mcmc_all']
+        for mcmc_metric_name in mcmc_metric_names:
+            metric.plot(1 + df.index[:MAX_EPOCH],
+                df[mcmc_metric_name][:MAX_EPOCH],
+                label=f'libFM MCMC {mcmc_metric_name}')
+        # print('MCMC', df[mcmc_metric_name][:MAX_EPOCH])
+
+    if dataset in vbfm:
+        df = pd.read_csv(vbfm[dataset], sep='\t')
+        metric.plot(1 + df.index[:MAX_EPOCH], df['rmse_mcmc_this'][:MAX_EPOCH], label='VBFM this')
 
     if dataset in ovbfm:
         df = pd.read_csv(ovbfm[dataset], sep='\t')
-        metric.plot(1 + df.index[:MAX_EPOCH], df['rmse_mcmc_this'][:MAX_EPOCH], label='OVBFM')
-        print('OVBFM', df['rmse_mcmc_this'][:MAX_EPOCH])
+        metric.plot(1 + df.index[:MAX_EPOCH], df['rmse_mcmc_this'][:MAX_EPOCH], label='OVBFM this')
+        # print('OVBFM', df['rmse_mcmc_all'][:MAX_EPOCH])
 
     if dataset in als:
         df = pd.read_csv(als[dataset])
         metric.plot(1 + df.index[:MAX_EPOCH], df['rmse'][:MAX_EPOCH], label='libFM ALS')
 
-metric.set_title('Test {:s} ↓ over epochs'.format(metric_name.upper()))
 metric.legend()
 if metric_name == 'rmse':
     metric.set_ylim(ymax=1.2)
