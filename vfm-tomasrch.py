@@ -5,14 +5,19 @@ JJV for Deep Learning course, 2022
 import torch
 from torch import nn, distributions
 from torch.utils.tensorboard import SummaryWriter
-from tqdm import tqdm
+from rich.progress import Progress, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn, TimeRemainingColumn
 import numpy as np
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error, average_precision_score
 import pandas as pd
 from prepare import load_data
+import matplotlib.pyplot as plt
+
+import torchvision.models as models
+from torch.profiler import profile, record_function, ProfilerActivity
 
 torch.manual_seed(42)
+device = torch.device('cuda')
 
 def draw_graph(start, watch=[]):
     from graphviz import Digraph
@@ -129,7 +134,7 @@ else:
         y = torch.Tensor(df['rating'])
     elif DATA.startswith('movie100k'):
         N_EPOCHS = 50
-        DISPLAY_EPOCH_EVERY = 2
+        DISPLAY_EPOCH_EVERY = 1
         BATCH_SIZE = 800
         '''df = pd.read_csv('data/movie100k/data.csv')#.head(1000)
                                 if DATA.endswith('batch'):
@@ -168,11 +173,16 @@ else:
         X_train, X_test, y_train, y_test = train_test_split(
             X, y, test_size=0.2, shuffle=True)
 
+X_train = X_train.to(device)
+y_train = y_train.to(device)
+X_test = X_test.to(device)
+y_test, y_test_cpu = y_test.to(device), y_test
 train_dataset = torch.utils.data.TensorDataset(X_train, y_train)
 test_dataset = torch.utils.data.TensorDataset(X_test, y_test)
 train_iter = torch.utils.data.DataLoader(
     train_dataset, batch_size=BATCH_SIZE) # , shuffle=True
 
+all_entities = torch.arange(start=0, end=N+M, device=device)
 
 class CF(nn.Module):
     """
@@ -188,10 +198,13 @@ class CF(nn.Module):
         self.bias_params = nn.Embedding(N + M, 2)  # w
         self.entity_params = nn.Embedding(N + M, 2 * embedding_size)  # V
         self.bias_prior = distributions.normal.Normal(
-            torch.Tensor([0.]), torch.Tensor([1.]))
+            torch.Tensor([0.]).to(device),
+            torch.Tensor([1.]).to(device)
+        )
         self.entity_prior = distributions.independent.Independent(
             distributions.normal.Normal(
-                torch.zeros(embedding_size), torch.ones(embedding_size)
+                torch.zeros(embedding_size, device=device),
+                torch.ones(embedding_size, device=device)
             ), 1
         )
         self.drawn = False
@@ -201,12 +214,12 @@ class CF(nn.Module):
     def draw(self):
         if self.drawn:
             return
-        all_bias_params = self.bias_params(torch.arange(start=0, end=N+M))
+        all_bias_params = self.bias_params(all_entities)
         self.bias_sampler = distributions.normal.Normal(
             all_bias_params[:, 0],
             nn.functional.softplus(all_bias_params[:, 1])
         )
-        all_entity_params = self.entity_params(torch.arange(start=0, end=N+M))
+        all_entity_params = self.entity_params(all_entities)
         self.entity_sampler = distributions.independent.Independent(
             distributions.normal.Normal(
                 all_entity_params[:, :EMBEDDING_SIZE],
@@ -216,7 +229,7 @@ class CF(nn.Module):
 
         self.all_bias = self.bias_sampler.rsample((N_VARIATIONAL_SAMPLES,))
         self.all_entity = self.entity_sampler.rsample((N_VARIATIONAL_SAMPLES,))
-        self.dra = True
+        # self.drawn = True
 
     def forward(self, x):
         self.draw()
@@ -238,13 +251,25 @@ class CF(nn.Module):
             distributions.kl.kl_divergence(self.entity_sampler, self.entity_prior))
 
 
-model = CF(EMBEDDING_SIZE, output=OUTPUT_TYPE)
+model = CF(EMBEDDING_SIZE, output=OUTPUT_TYPE).to(device)
 mse_loss = nn.MSELoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
 # optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
 train_rmse = train_auc = train_map = 0.
 losses = []
-for epoch in tqdm(range(N_EPOCHS)):
+y_pred_all = np.zeros(len(test_dataset))
+rmses = {'all': [], 'this': []}
+with Progress(
+    BarColumn(),
+    TaskProgressColumn(),
+    TimeElapsedColumn(),
+    TimeRemainingColumn(),
+    TextColumn('[progress.description]Elbo: {task.fields[elbo]:.4f} RMSE: {task.fields[test_rmse]:.4f} All: {task.fields[all_rmse]:.4f}'),
+) as progress:
+  training = progress.add_task('VFM training...', total=N_EPOCHS, elbo=float('nan'), test_rmse=float('nan'), all_rmse=float('nan'))
+  for epoch in range(N_EPOCHS):
+    model.drawn = False
+
     losses = []
     pred = []
     truth = []
@@ -262,12 +287,11 @@ for epoch in tqdm(range(N_EPOCHS)):
         loss.backward()
         optimizer.step()
 
-        y_pred = outputs.mean.detach().numpy().clip(1, 5)
+        y_pred = outputs.mean.detach().cpu().numpy().clip(1, 5)
         pred.extend(y_pred)
-        truth.extend(target)
+        truth.extend(target.cpu())
         losses.append(loss.item())
 
-    model.drawn = False
     # End of epoch
     if OUTPUT_TYPE == 'reg':
         train_rmse = mean_squared_error(truth, pred) ** 0.5
@@ -291,17 +315,30 @@ for epoch in tqdm(range(N_EPOCHS)):
         # print('bias max abs', model.bias_params.weight.abs().max())
         # print('entity max abs', model.entity_params.weight.abs().max())
 
+        model.drawn = True
         outputs, _, _ = model(X_test)
-        y_pred = outputs.mean.detach().numpy().clip(1, 5)
-        print('test pred', np.round(y_pred[-5:], 4), y_test[-5:])
+        y_pred = outputs.mean.detach().cpu().numpy().clip(1, 5)
+        y_pred_all += y_pred
+        print('test pred')
+        for name, pred in zip(['this', 'all ', 'true'],
+                [y_pred[-5:], y_pred_all[-5:]/(epoch+1), y_test_cpu[-5:].numpy()]):
+            print(name, ' '.join(f'{i:.4f}' for i in pred))
         if OUTPUT_TYPE == 'reg':
-            test_rmse = mean_squared_error(y_test, y_pred) ** 0.5
-            print('Test RMSE', test_rmse)
+            test_rmse = mean_squared_error(y_test_cpu, y_pred) ** 0.5
+            all_rmse = mean_squared_error(y_test_cpu, y_pred_all / (epoch + 1)) ** 0.5
+            rmses['this'].append(test_rmse)
+            rmses['all'].append(all_rmse)
+            print('Test RMSE', test_rmse, 'All RMSE', all_rmse)
         else:
-            test_auc = roc_auc_score(y_test, y_pred)
-            test_map = average_precision_score(y_test, y_pred)
+            test_auc = roc_auc_score(y_test_cpu, y_pred)
+            test_map = average_precision_score(y_test_cpu, y_pred)
             print(f'Test AUC {test_auc:.4f} Test MAP {test_map:.4f}')
+    progress.update(training, advance=1, elbo=np.mean(losses), test_rmse=test_rmse, all_rmse=all_rmse)
 
+plt.plot(rmses['this'], label='VFM this')
+plt.plot(rmses['all'], label='VFM all')
+plt.legend()
+plt.savefig('VFMrmses.png')
 
 if DATA == 'movielens':
     writer = SummaryWriter(log_dir='logs/embeddings')  # TBoard
