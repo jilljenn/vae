@@ -287,7 +287,7 @@ with Progress(
         loss.backward()
         optimizer.step()
 
-        y_pred = outputs.mean.detach().cpu().numpy().clip(1, 5)
+        y_pred = outputs.sample().detach().cpu().numpy().clip(1, 5)
         pred.extend(y_pred)
         truth.extend(target.cpu())
         losses.append(loss.item())
@@ -315,9 +315,8 @@ with Progress(
         # print('bias max abs', model.bias_params.weight.abs().max())
         # print('entity max abs', model.entity_params.weight.abs().max())
 
-        model.drawn = True
         outputs, _, _ = model(X_test)
-        y_pred = outputs.mean.detach().cpu().numpy().clip(1, 5)
+        y_pred = outputs.sample().detach().cpu().numpy().clip(1, 5)
         y_pred_all += y_pred
         print('test pred')
         for name, pred in zip(['this', 'all ', 'true'],
