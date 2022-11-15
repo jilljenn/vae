@@ -12,12 +12,13 @@ from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error, average
 import pandas as pd
 from prepare import load_data
 import matplotlib.pyplot as plt
+from torchmin import minimize
 
 # import torchvision.models as models
 # from torch.profiler import profile, record_function, ProfilerActivity
 
 torch.manual_seed(42)
-device = torch.device('cpu')  # cuda
+device = torch.device('cuda')  # cuda
 
 def draw_graph(start, watch=[]):
     from graphviz import Digraph
@@ -83,7 +84,7 @@ LEARNING_RATE = 0.1
 EMBEDDING_SIZE = 20
 N_VARIATIONAL_SAMPLES = 1
 OUTPUT_TYPE = 'reg'
-
+LBFGS = False
 
 # DATA = 'toy'
 # DATA = 'movielens'
@@ -133,10 +134,10 @@ else:
         X = torch.LongTensor(df[['user', 'item']].to_numpy())
         y = torch.Tensor(df['rating'])
     elif DATA.startswith('movie100k'):
-        N_EPOCHS = 200
+        N_EPOCHS = 50
         DISPLAY_EPOCH_EVERY = 1
-        BATCH_SIZE = 800
-        BATCH_SIZE = 100000
+        BATCH_SIZE = 1024
+        # BATCH_SIZE = 100000
         '''df = pd.read_csv('data/movie100k/data.csv')#.head(1000)
                                 if DATA.endswith('batch'):
                                     N_EPOCHS = 100
@@ -216,7 +217,8 @@ class CF(nn.Module):
         #         ))).shape)
 
         self.global_bias_prior = distributions.normal.Normal(
-            torch.Tensor([0.]), torch.nn.functional.softplus(self.prec_global_bias_prior))
+            torch.Tensor([0.]).to(device),
+            torch.nn.functional.softplus(self.prec_global_bias_prior))
         self.bias_prior = distributions.normal.Normal(
             torch.zeros(N + M).to(device),
             torch.nn.functional.softplus(torch.cat((
@@ -287,15 +289,27 @@ class CF(nn.Module):
                 distributions.kl.kl_divergence(self.entity_sampler, self.entity_prior)
             ])
 
-
 model = CF(EMBEDDING_SIZE, output=OUTPUT_TYPE).to(device)
 mse_loss = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+if LBFGS:
+    if True:
+        result = minimize(fn, x0, 'BFGS')
+    else:
+        optimizer = torch.optim.LBFGS(model.parameters(), lr=LEARNING_RATE, line_search_fn='strong_wolfe')
+        def closure():
+            optimizer.zero_grad()
+            outputs, kl_bias, kl_entity = model(indices)
+            obj = -outputs.log_prob(target.float()).mean() + kl_bias.mean() + kl_entity.mean()
+            obj.backward()
+            return obj
+else:
+    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
 # optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
 train_rmse = train_auc = train_map = 0.
 losses = []
 y_pred_all = np.zeros(len(test_dataset))
 rmses = {'all': [], 'this': []}
+
 with Progress(
     BarColumn(),
     TaskProgressColumn(),
@@ -323,9 +337,12 @@ with Progress(
 
         y_pred = outputs.sample().detach().cpu().numpy().clip(1, 5)
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if not LBFGS:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+        else:
+            optimizer.step(closure)
 
         # print(y_pred.shape)
         pred.extend(y_pred)
@@ -358,14 +375,15 @@ with Progress(
 
         outputs, _ = model(X_test)
         y_pred = outputs.sample().detach().cpu().numpy().clip(1, 5)
-        y_pred_all += y_pred
+        if epoch >= 5:
+            y_pred_all += y_pred
         print('test pred')
         for name, pred in zip(['this', 'all ', 'true'],
-                [y_pred[-5:], y_pred_all[-5:]/(epoch+1), y_test_cpu[-5:].numpy()]):
+                [y_pred[-5:], y_pred_all[-5:]/max(1, epoch-4), y_test_cpu[-5:].numpy()]):
             print(name, ' '.join(f'{i:.4f}' for i in pred))
         if OUTPUT_TYPE == 'reg':
             test_rmse = mean_squared_error(y_test_cpu, y_pred) ** 0.5
-            all_rmse = mean_squared_error(y_test_cpu, y_pred_all / (epoch + 1)) ** 0.5
+            all_rmse = mean_squared_error(y_test_cpu, y_pred_all / max(1, (epoch - 4))) ** 0.5
             rmses['this'].append(test_rmse)
             rmses['all'].append(all_rmse)
             print('Test RMSE', test_rmse, 'All RMSE', all_rmse)
@@ -374,6 +392,7 @@ with Progress(
             test_map = average_precision_score(y_test_cpu, y_pred)
             print(f'Test AUC {test_auc:.4f} Test MAP {test_map:.4f}')
     progress.update(training, advance=1, elbo=np.mean(losses), test_rmse=test_rmse, all_rmse=all_rmse)
+    print(model.alpha)
 
 plt.plot(rmses['this'], label='VFM this')
 plt.plot(rmses['all'], label='VFM all')
