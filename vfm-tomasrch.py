@@ -13,11 +13,11 @@ import pandas as pd
 from prepare import load_data
 import matplotlib.pyplot as plt
 
-import torchvision.models as models
-from torch.profiler import profile, record_function, ProfilerActivity
+# import torchvision.models as models
+# from torch.profiler import profile, record_function, ProfilerActivity
 
 torch.manual_seed(42)
-device = torch.device('cuda')
+device = torch.device('cpu')  # cuda
 
 def draw_graph(start, watch=[]):
     from graphviz import Digraph
@@ -133,9 +133,10 @@ else:
         X = torch.LongTensor(df[['user', 'item']].to_numpy())
         y = torch.Tensor(df['rating'])
     elif DATA.startswith('movie100k'):
-        N_EPOCHS = 50
+        N_EPOCHS = 200
         DISPLAY_EPOCH_EVERY = 1
         BATCH_SIZE = 800
+        BATCH_SIZE = 100000
         '''df = pd.read_csv('data/movie100k/data.csv')#.head(1000)
                                 if DATA.endswith('batch'):
                                     N_EPOCHS = 100
@@ -145,6 +146,7 @@ else:
         # df = df.merge(films, on='movieId')
 
         N, M, X_train, X_test, y_train, y_test = load_data('movie100k')
+        nb_samples_train = len(X_train)
         X_train = torch.LongTensor(X_train)
         y_train = torch.Tensor(y_train)
         X_test = torch.LongTensor(X_test)
@@ -192,28 +194,56 @@ class CF(nn.Module):
         super().__init__()
         self.output = output
         self.alpha = nn.Parameter(torch.Tensor([1e3]), requires_grad=True)
-        self.global_bias = nn.Parameter(torch.Tensor([0.]), requires_grad=True)
+        self.global_bias_mean = nn.Parameter(torch.Tensor([0.]), requires_grad=True)
+        self.global_bias_scale = nn.Parameter(torch.Tensor([1.]), requires_grad=True)
+        self.prec_global_bias_prior = nn.Parameter(torch.Tensor([1.]), requires_grad=True)
+        self.prec_user_bias_prior = nn.Parameter(torch.Tensor([1.]), requires_grad=True)
+        self.prec_item_bias_prior = nn.Parameter(torch.Tensor([1.]), requires_grad=True)
+        self.prec_user_entity_prior = nn.Parameter(torch.ones((1, EMBEDDING_SIZE)), requires_grad=True)
+        self.prec_item_entity_prior = nn.Parameter(torch.ones((1, EMBEDDING_SIZE)), requires_grad=True)
         # self.alpha = torch.Tensor([1.])
         # nn.init.uniform_(self.alpha)
         self.bias_params = nn.Embedding(N + M, 2)  # w
         self.entity_params = nn.Embedding(N + M, 2 * embedding_size)  # V
+        self.drawn = False
+
+    def update_priors(self):
+
+        # print('kikoo entity prior',
+        #     torch.nn.functional.softplus(torch.cat((
+        #             self.prec_user_entity_prior.repeat(N, 1),
+        #             self.prec_item_entity_prior.repeat(M, 1)
+        #         ))).shape)
+
+        self.global_bias_prior = distributions.normal.Normal(
+            torch.Tensor([0.]), torch.nn.functional.softplus(self.prec_global_bias_prior))
         self.bias_prior = distributions.normal.Normal(
-            torch.Tensor([0.]).to(device),
-            torch.Tensor([1.]).to(device)
+            torch.zeros(N + M).to(device),
+            torch.nn.functional.softplus(torch.cat((
+                self.prec_user_bias_prior.repeat(N),
+                self.prec_item_bias_prior.repeat(M)
+            )))
+            # torch.ones(N + M).to(device)
         )
         self.entity_prior = distributions.independent.Independent(
             distributions.normal.Normal(
-                torch.zeros(embedding_size, device=device),
-                torch.ones(embedding_size, device=device)
+                torch.zeros((N + M, EMBEDDING_SIZE), device=device),
+                torch.nn.functional.softplus(torch.cat((
+                    self.prec_user_entity_prior.repeat(N, 1),
+                    self.prec_item_entity_prior.repeat(M, 1)
+                )))
             ), 1
         )
-        self.drawn = False
-        # self.entity_prior = distributions.multivariate_normal.MultivariateNormal(
-        #     torch.zeros(embedding_size), scale_tril=torch.eye(embedding_size))
 
     def draw(self):
         if self.drawn:
             return
+        # Global bias
+        self.global_bias_sampler = distributions.normal.Normal(
+            self.global_bias_mean,
+            nn.functional.softplus(self.global_bias_scale)
+        )
+        # Biases and entities
         all_bias_params = self.bias_params(all_entities)
         self.bias_sampler = distributions.normal.Normal(
             all_bias_params[:, 0],
@@ -227,11 +257,13 @@ class CF(nn.Module):
             ), 1
         )
 
+        self.global_bias = self.global_bias_sampler.rsample((N_VARIATIONAL_SAMPLES,)).mean()  # Only one scalar
         self.all_bias = self.bias_sampler.rsample((N_VARIATIONAL_SAMPLES,))
         self.all_entity = self.entity_sampler.rsample((N_VARIATIONAL_SAMPLES,))
         # self.drawn = True
 
     def forward(self, x):
+        self.update_priors()
         self.draw()
         biases = torch.index_select(self.all_bias, 1, x.flatten()).reshape((N_VARIATIONAL_SAMPLES, -1, 2))
         entities = torch.index_select(self.all_entity, 1, x.flatten()).reshape((N_VARIATIONAL_SAMPLES, -1, 2, EMBEDDING_SIZE))
@@ -241,14 +273,19 @@ class CF(nn.Module):
         users_items_emb = entities.prod(axis=2).sum(axis=2).mean(axis=0)
         # print('final', sum_users_items_biases.shape, users_items_emb.shape)
         std_dev = torch.sqrt(1 / nn.functional.softplus(self.alpha))
+        # print('global bias, sum_users_items_biases', self.global_bias.shape, sum_users_items_biases.shape)
         unscaled_pred = self.global_bias + sum_users_items_biases + users_items_emb
+        # print('unscaled pred', unscaled_pred.shape)
         if self.output == 'reg':
             likelihood = distributions.normal.Normal(unscaled_pred, std_dev)
         else:
             likelihood = distributions.bernoulli.Bernoulli(logits=unscaled_pred)
         return (likelihood,
-            distributions.kl.kl_divergence(self.bias_sampler, self.bias_prior),
-            distributions.kl.kl_divergence(self.entity_sampler, self.entity_prior))
+            [
+                distributions.kl.kl_divergence(self.global_bias_sampler, self.global_bias_prior),
+                distributions.kl.kl_divergence(self.bias_sampler, self.bias_prior),
+                distributions.kl.kl_divergence(self.entity_sampler, self.entity_prior)
+            ])
 
 
 model = CF(EMBEDDING_SIZE, output=OUTPUT_TYPE).to(device)
@@ -273,27 +310,31 @@ with Progress(
     losses = []
     pred = []
     truth = []
+    # print('drawn', model.drawn)
     for indices, target in train_iter:
         # with torch.autograd.detect_anomaly():
-        outputs, kl_bias, kl_entity = model(indices)#.squeeze()
+        outputs, kls = model(indices)#.squeeze()
         # print(outputs.shape)
         # loss = loss_function(outputs, target)
-        # print('kl', kl_bias.shape, kl_entity.shape)
+        # print('KLs', [t.shape for t in kls])
         # print(outputs.sample()[:5], target[:5])
-        loss = -outputs.log_prob(target.float()).mean() #+ kl_bias.mean() + kl_entity.mean()
+        loss = -outputs.log_prob(target.float()).mean() * nb_samples_train + sum([kl.sum() for kl in kls])
         train_auc = -1
+
+        y_pred = outputs.sample().detach().cpu().numpy().clip(1, 5)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-        y_pred = outputs.sample().detach().cpu().numpy().clip(1, 5)
+        # print(y_pred.shape)
         pred.extend(y_pred)
         truth.extend(target.cpu())
         losses.append(loss.item())
 
     # End of epoch
     if OUTPUT_TYPE == 'reg':
+        # print('truth pred', len(truth), len(pred), truth[:5], pred[:5])
         train_rmse = mean_squared_error(truth, pred) ** 0.5
     else:
         train_auc = roc_auc_score(truth, pred)
@@ -315,7 +356,7 @@ with Progress(
         # print('bias max abs', model.bias_params.weight.abs().max())
         # print('entity max abs', model.entity_params.weight.abs().max())
 
-        outputs, _, _ = model(X_test)
+        outputs, _ = model(X_test)
         y_pred = outputs.sample().detach().cpu().numpy().clip(1, 5)
         y_pred_all += y_pred
         print('test pred')

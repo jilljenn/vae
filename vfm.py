@@ -31,7 +31,7 @@ import pickle
 import yaml
 import json
 import time
-import sys  # Breaks
+from prepare import load_data
 
 
 DESCRIPTION = 'Rescaled mode and test every step'
@@ -54,7 +54,8 @@ parser.add_argument('--train_patience', type=int, nargs='?', default=4)
 parser.add_argument('--d', type=int, nargs='?', default=3)
 parser.add_argument('--lr', type=float, nargs='?', default=0.01)
 parser.add_argument('--nb_batches', type=int, nargs='?', default=1)
-parser.add_argument('--epochs', type=int, nargs='?', default=200)
+parser.add_argument('--min_epochs', type=int, nargs='?', default=200)
+parser.add_argument('--max_epochs', type=int, nargs='?', default=200)
 parser.add_argument('--var_samples', type=int, nargs='?', default=1)
 parser.add_argument('--method', type=str, nargs='?', default='adam')
 parser.add_argument('--link', type=str, nargs='?', default='softplus')
@@ -69,10 +70,11 @@ DATA_PATH = Path('data') / DATA
 logging.warning('Data is %s', DATA)
 VERBOSE = options.v
 NB_VARIATIONAL_SAMPLES = options.var_samples
-COMPUTE_TEST_EVERY = 5
+COMPUTE_TEST_EVERY = 1
 N_QUESTIONS_ASKED = 20
 TRAIN_EVERY_N_QUESTIONS = 4
-MAX_EPOCHS = options.epochs
+MIN_EPOCHS = options.min_epochs
+MAX_EPOCHS = options.max_epochs
 embedding_size = options.d
 nb_iters = options.nb_batches
 learning_rate = options.lr  # learning_rate 0.001 works better for classification
@@ -82,7 +84,7 @@ link = tf.nn.softplus if options.link == 'softplus' else tf.math.abs
 
 
 # Load data
-if DATA in {'fraction', 'movie1M', 'movie10M', 'movie100k'}:
+if DATA in {'fraction', 'movie1M', 'movie10M', 'movie100k', 'movie100k-binary'}:
     df = pd.read_csv(DATA_PATH / 'data.csv')
     print('Starts at', df['user'].min(), df['item'].min())
     try:
@@ -117,7 +119,7 @@ else:
 if options.regression or 'rating' in df:
     is_regression = True
     is_classification = False
-elif options.classification or 'outcome' in df:
+if options.classification or 'outcome' in df:
     is_classification = True
     is_regression = False
 
@@ -780,7 +782,12 @@ class VFM:
         if self.category_watcher == 'train':
             last_values = self.metrics[self.category_watcher][self.metric_watcher][-self.train_patience:]
             is_decreasing = self.metric_watcher in {'acc', 'auc', 'elbo'}  # If these metrics decrease, it's worse
-            return (self.epoch >= MAX_EPOCHS or (len(last_values) >= self.train_patience and last_values == sorted(last_values, reverse=is_decreasing))), last_values
+            return (
+                self.epoch >= MAX_EPOCHS or (
+                    self.epoch >= MIN_EPOCHS and
+                    len(last_values) >= self.train_patience and
+                    last_values == sorted(last_values, reverse=is_decreasing)
+                ), last_values)
         elif self.epoch < K - 1 or self.epoch % self.valid_patience != 0:
             return False, []
         else:  # Try tracking quotient
@@ -799,8 +806,9 @@ class VFM:
         if len(self.metrics[category]['epoch']) == 0 or self.metrics[category]['epoch'][-1] != epoch:
             self.metrics[category]['epoch'].append(epoch)
         self.all_preds.append(y_pred.tolist())
-        self.metrics[category]['acc'].append(np.mean(y_truth == np.round(y_pred)))
         mean_pred = np.array(self.all_preds).mean(axis=0)
+        self.metrics[category]['acc'].append(np.mean(y_truth == np.round(y_pred)))
+        self.metrics[category]['acc_all'].append(np.mean(y_truth == np.round(mean_pred)))
         # print('shape', mean_pred.shape)
         # sys.exit(0)
         if set(y_truth) == {0., 1.}:
@@ -840,6 +848,7 @@ class VFM:
         plot_after(data, save_to_path)
         with open(save_to_path, 'w') as f:
             f.write(json.dumps(data, indent=4))
+        os.system(f'python rule.py {save_to_path}')
 
     def plot(self, category):
         plt.clf()

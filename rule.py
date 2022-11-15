@@ -22,6 +22,7 @@ als = {
 
 vbfm = {
     'movie100k': LIBFM_RESULTS_PATH / 'vbfm_100k.csv',
+    'movie100k-binary': LIBFM_RESULTS_PATH / 'vbfm_100k_binary.csv',
 }
 
 ovbfm = {
@@ -34,6 +35,7 @@ mcmc = {
     'movie100': LIBFM_RESULTS_PATH / 'mcmc_100',
     'movie1000': LIBFM_RESULTS_PATH / 'mcmc_1000',
     'movie100k': LIBFM_RESULTS_PATH / 'mcmc_100k.csv',
+    'movie100k-binary': LIBFM_RESULTS_PATH / 'mcmc_100k_binary.csv',
     'movie1M': LIBFM_RESULTS_PATH / 'mcmc_1M',
     'movie10M': LIBFM_RESULTS_PATH / 'mcmc_10M'
 }
@@ -43,7 +45,8 @@ with open(log_name) as f:
     data = json.load(f)
 
 dataset = data['args']['data']
-metric_name = 'acc' if dataset in {'fraction', 'movie5', 'movie20', 'movie100'} else 'rmse'
+metric_name = 'acc' if dataset in {'fraction', 'movie5', 'movie20', 'movie100', 'movie100k-binary'} else 'rmse'
+CPP_METRIC = f'{metric_name}_mcmc_this'
 
 train_epochs = np.unique(sorted(data['metrics']['train']['epoch']))
 print('Train', min(train_epochs), max(train_epochs))
@@ -93,9 +96,11 @@ else:
 
 if metric_name in data['metrics']['train']:
     metric.plot(train_epochs, data['metrics']['train'][metric_name], label='train {:s}'.format(metric_name))
-metric.plot(data['metrics']['test']['epoch'], data['metrics']['test'][metric_name], label='VFM')
+metric.plot(data['metrics']['test']['epoch'], data['metrics']['test'][metric_name], label='VFM this')
 if 'rmse_all' in data['metrics']['test']:
     metric.plot(data['metrics']['test']['epoch'], data['metrics']['test']['rmse_all'], label='VFM all')
+if 'acc_all' in data['metrics']['test']:
+    metric.plot(data['metrics']['test']['epoch'], data['metrics']['test']['acc_all'], label='VFM all')
 
 # print('VFM', data['metrics']['test'][metric_name])
 MAX_EPOCH = 400 # max(data['metrics']['test']['epoch'])
@@ -118,8 +123,10 @@ if cv:
 else:
     if dataset in mcmc:
         df = pd.read_csv(mcmc[dataset], sep='\t')
-        mcmc_metric_names = 'accuracy' if metric_name == 'acc' else [
-            'rmse_mcmc_this', 'rmse_mcmc_all']
+        print(df.columns)
+        mcmc_metric_names = (
+            ['acc_mcmc_this', 'acc_mcmc_all'] if metric_name == 'acc'
+            else ['rmse_mcmc_this', 'rmse_mcmc_all'])
         for mcmc_metric_name in mcmc_metric_names:
             metric.plot(1 + df.index[:MAX_EPOCH],
                 df[mcmc_metric_name][:MAX_EPOCH],
@@ -128,11 +135,11 @@ else:
 
     if dataset in vbfm:
         df = pd.read_csv(vbfm[dataset], sep='\t')
-        metric.plot(1 + df.index[:MAX_EPOCH], df['rmse_mcmc_this'][:MAX_EPOCH], label='VBFM this')
+        metric.plot(1 + df.index[:MAX_EPOCH], df[CPP_METRIC][:MAX_EPOCH], label='VBFM this')
 
     if dataset in ovbfm:
         df = pd.read_csv(ovbfm[dataset], sep='\t')
-        metric.plot(1 + df.index[:MAX_EPOCH], df['rmse_mcmc_this'][:MAX_EPOCH], label='OVBFM this')
+        metric.plot(1 + df.index[:MAX_EPOCH], df[CPP_METRIC][:MAX_EPOCH], label='OVBFM this')
         # print('OVBFM', df['rmse_mcmc_all'][:MAX_EPOCH])
 
     if dataset in als:
