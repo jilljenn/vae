@@ -12,6 +12,7 @@ from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error, average
 import pandas as pd
 from prepare import load_data
 
+torch.manual_seed(42)
 
 LEARNING_RATE = 0.1
 EMBEDDING_SIZE = 20
