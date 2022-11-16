@@ -27,9 +27,10 @@ def load_data(DATA, output_type='reg'):
                             for user, item, outcome in np.array(df.loc[i[dataset], ['user', 'shifted_item', outcome_column]]):
                                 f.write('{:d} {:d}:1 {:d}:1\n'.format(outcome, user, item))'''
 
-    return df['user'].nunique(), df['item'].nunique(), X_train, X_test, y_train, y_test
+    return df['user'].nunique(), df['item'].nunique(), X_train, X_test, y_train, y_test, i
 
-def prepare_data(DATA):
+def prepare_data(DATA, is_classification):
+    outcome_column = 'outcome' if is_classification else 'rating'
     i = {}
     DATA_PATH = Path('data') / DATA
     df = pd.read_csv(DATA_PATH / 'data.csv')
@@ -50,8 +51,8 @@ def prepare_data(DATA):
     for dataset in ['trainval', 'test']:
         if not (DATA_PATH / f'{DATA}.{dataset}_libfm').is_file():
             with open(DATA_PATH / f'{DATA}.{dataset}_libfm', 'w') as f:
-                for user, item, rating in np.array(df.loc[i[dataset], ['user', 'shifted_item', 'rating']]):
-                    f.write('{:d} {:d}:1 {:d}:1\n'.format(rating, user, item))
+                for user, item, outcome in np.array(df.loc[i[dataset], ['user', 'shifted_item', outcome_column]]):
+                    f.write('{:d} {:d}:1 {:d}:1\n'.format(outcome, user, item))
         else:
             logging.warning(f'Already existing OVBFM {dataset}')
 
@@ -96,7 +97,7 @@ if __name__ == '__main__':
 
     DATA = options.data
 
-    if DATA == 'movie100k':
-        prepare_data(DATA)
-    elif DATA == 'ml-latest':
+    if DATA == 'ml-latest':
         prepare_ml_latest()
+    else:
+        prepare_data(DATA, DATA.endswith('binary'))
