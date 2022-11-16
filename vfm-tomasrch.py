@@ -12,7 +12,7 @@ from sklearn.metrics import roc_auc_score, log_loss, mean_squared_error, average
 import pandas as pd
 from prepare import load_data
 import matplotlib.pyplot as plt
-from torchmin import minimize
+from torchmin import Minimizer
 
 # import torchvision.models as models
 # from torch.profiler import profile, record_function, ProfilerActivity
@@ -134,9 +134,9 @@ else:
         X = torch.LongTensor(df[['user', 'item']].to_numpy())
         y = torch.Tensor(df['rating'])
     elif DATA.startswith('movie100k'):
-        N_EPOCHS = 50
+        N_EPOCHS = 200
         DISPLAY_EPOCH_EVERY = 1
-        BATCH_SIZE = 1024
+        BATCH_SIZE = 800
         # BATCH_SIZE = 100000
         '''df = pd.read_csv('data/movie100k/data.csv')#.head(1000)
                                 if DATA.endswith('batch'):
@@ -202,6 +202,12 @@ class CF(nn.Module):
         self.prec_item_bias_prior = nn.Parameter(torch.Tensor([1.]), requires_grad=True)
         self.prec_user_entity_prior = nn.Parameter(torch.ones((1, EMBEDDING_SIZE)), requires_grad=True)
         self.prec_item_entity_prior = nn.Parameter(torch.ones((1, EMBEDDING_SIZE)), requires_grad=True)
+
+        self.mean_prec_global_bias_prior = nn.Parameter(torch.Tensor([0.]), requires_grad=True)
+        self.mean_prec_user_bias_prior = nn.Parameter(torch.Tensor([0.]), requires_grad=True)
+        self.mean_prec_item_bias_prior = nn.Parameter(torch.Tensor([0.]), requires_grad=True)
+        self.mean_prec_user_entity_prior = nn.Parameter(torch.ones((1, EMBEDDING_SIZE)), requires_grad=True)
+        self.mean_prec_item_entity_prior = nn.Parameter(torch.ones((1, EMBEDDING_SIZE)), requires_grad=True)
         # self.alpha = torch.Tensor([1.])
         # nn.init.uniform_(self.alpha)
         self.bias_params = nn.Embedding(N + M, 2)  # w
@@ -218,9 +224,14 @@ class CF(nn.Module):
 
         self.global_bias_prior = distributions.normal.Normal(
             torch.Tensor([0.]).to(device),
+            # self.mean_prec_global_bias_prior,
             torch.nn.functional.softplus(self.prec_global_bias_prior))
         self.bias_prior = distributions.normal.Normal(
             torch.zeros(N + M).to(device),
+            # torch.cat((
+            #     self.mean_prec_user_bias_prior.repeat(N),
+            #     self.mean_prec_item_bias_prior.repeat(M)
+            # )),
             torch.nn.functional.softplus(torch.cat((
                 self.prec_user_bias_prior.repeat(N),
                 self.prec_item_bias_prior.repeat(M)
@@ -230,6 +241,10 @@ class CF(nn.Module):
         self.entity_prior = distributions.independent.Independent(
             distributions.normal.Normal(
                 torch.zeros((N + M, EMBEDDING_SIZE), device=device),
+                # torch.cat((
+                #     self.mean_prec_user_entity_prior.repeat(N, 1),
+                #     self.mean_prec_item_entity_prior.repeat(M, 1)
+                # )),
                 torch.nn.functional.softplus(torch.cat((
                     self.prec_user_entity_prior.repeat(N, 1),
                     self.prec_item_entity_prior.repeat(M, 1)
@@ -291,108 +306,150 @@ class CF(nn.Module):
 
 model = CF(EMBEDDING_SIZE, output=OUTPUT_TYPE).to(device)
 mse_loss = nn.MSELoss()
-if LBFGS:
-    if True:
-        result = minimize(fn, x0, 'BFGS')
-    else:
-        optimizer = torch.optim.LBFGS(model.parameters(), lr=LEARNING_RATE, line_search_fn='strong_wolfe')
-        def closure():
-            optimizer.zero_grad()
-            outputs, kl_bias, kl_entity = model(indices)
-            obj = -outputs.log_prob(target.float()).mean() + kl_bias.mean() + kl_entity.mean()
-            obj.backward()
-            return obj
-else:
-    optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
-# optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
 train_rmse = train_auc = train_map = 0.
 losses = []
+y_preds = []
 y_pred_all = np.zeros(len(test_dataset))
 rmses = {'all': [], 'this': []}
 
+entity_count = torch.tensor(torch.cat((
+    torch.bincount(X_train[:, 0]),
+    torch.bincount(X_train[:, 1]-N)
+)), device=device).float()
+
 with Progress(
+    TextColumn("[progress.description]{task.description}"),
     BarColumn(),
     TaskProgressColumn(),
     TimeElapsedColumn(),
     TimeRemainingColumn(),
     TextColumn('[progress.description]Elbo: {task.fields[elbo]:.4f} RMSE: {task.fields[test_rmse]:.4f} All: {task.fields[all_rmse]:.4f}'),
 ) as progress:
-  training = progress.add_task('VFM training...', total=N_EPOCHS, elbo=float('nan'), test_rmse=float('nan'), all_rmse=float('nan'))
-  for epoch in range(N_EPOCHS):
-    model.drawn = False
-
-    losses = []
-    pred = []
-    truth = []
-    # print('drawn', model.drawn)
-    for indices, target in train_iter:
-        # with torch.autograd.detect_anomaly():
-        outputs, kls = model(indices)#.squeeze()
-        # print(outputs.shape)
-        # loss = loss_function(outputs, target)
-        # print('KLs', [t.shape for t in kls])
-        # print(outputs.sample()[:5], target[:5])
-        loss = -outputs.log_prob(target.float()).mean() * nb_samples_train + sum([kl.sum() for kl in kls])
-        train_auc = -1
-
-        y_pred = outputs.sample().detach().cpu().numpy().clip(1, 5)
-
-        if not LBFGS:
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+    if LBFGS:
+        opt_task = progress.add_task('Optimizing...', total=200, elbo=float('nan'), test_rmse=float('nan'), all_rmse=float('nan'))
+        if True:
+            def cb(_):
+                progress.update(opt_task, advance=1)
+            optimizer = Minimizer(model.parameters(),
+                                  method='newton-cg',
+                                  tol=1e-6,
+                                  options={
+                                      'lr': 10*LEARNING_RATE,
+                                  },
+                                  # max_iter=200,
+                                  disp=0,
+                                  callback=cb)
+    
+            def closure():
+                optimizer.zero_grad()
+                outputs, kls = model(indices)
+                loss = -outputs.log_prob(target.float()).mean() * nb_samples_train + sum([kl.sum() for kl in kls])
+                # loss.backward()
+                return loss
         else:
-            optimizer.step(closure)
-
-        # print(y_pred.shape)
-        pred.extend(y_pred)
-        truth.extend(target.cpu())
-        losses.append(loss.item())
-
-    # End of epoch
-    if OUTPUT_TYPE == 'reg':
-        # print('truth pred', len(truth), len(pred), truth[:5], pred[:5])
-        train_rmse = mean_squared_error(truth, pred) ** 0.5
+            optimizer = torch.optim.LBFGS(model.parameters(), lr=LEARNING_RATE, line_search_fn='strong_wolfe')
+            def closure():
+    
+                optimizer.zero_grad()
+                outputs, kl_bias, kl_entity = model(indices)
+                obj = -outputs.log_prob(target.float()).mean() + kl_bias.mean() + kl_entity.mean()
+                obj.backward()
+                return obj
     else:
-        train_auc = roc_auc_score(truth, pred)
-        train_map = average_precision_score(truth, pred)
+        optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    # optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
+    batch_task = progress.add_task('Running batches...', total=(len(train_dataset)+BATCH_SIZE-1)//BATCH_SIZE, elbo=float('nan'), test_rmse=float('nan'), all_rmse=float('nan'))
+    training = progress.add_task('VFM training...', total=N_EPOCHS, elbo=float('nan'), test_rmse=float('nan'), all_rmse=float('nan'))
+    for epoch in range(N_EPOCHS):
+        model.drawn = False
 
-    '''print('test', outputs.sample()[:5], target[:5], loss.item())
-        print('variance', torch.sqrt(1 / model.alpha))
-        print('bias max abs', model.bias_params.weight.abs().max())
-        print('entity max abs', model.entity_params.weight.abs().max())'''
+        losses = []
+        pred = []
+        truth = []
+        # print('drawn', model.drawn)
+        progress.update(batch_task, completed=0)
+        for indices, target in train_iter:
+            # with torch.autograd.detect_anomaly():
+            outputs, kls = model(indices)#.squeeze()
+            # print(outputs.shape)
+            # loss = loss_function(outputs, target)
+            # print('KLs', [t.shape for t in kls])
+            # print(outputs.sample()[:5], target[:5])
 
-    if epoch % DISPLAY_EPOCH_EVERY == 0:
-        print('train pred', np.round(pred[:5], 4), truth[:5])
-        print(f"Epoch {epoch}: Elbo {np.mean(losses):.4f} " +
-              (f"Minibatch train RMSE {train_rmse:.4f}" if OUTPUT_TYPE == 'reg' else
-               f"Minibatch train AUC {train_auc:.4f} " +
-               f"Minibatch train MAP {train_map:.4f}"))
+            entity_present = torch.bincount(indices.flatten(), minlength=N+M) > 0
 
-        # print('precision', model.alpha, 'std dev', torch.sqrt(1 / model.alpha))
-        # print('bias max abs', model.bias_params.weight.abs().max())
-        # print('entity max abs', model.entity_params.weight.abs().max())
+            # loss = -outputs.log_prob(target.float()).mean() * nb_samples_train \
+            #         + kls[0] + (N+M) * sum([kl[entity_present].mean() for kl in kls[1:]])
+            loss = -outputs.log_prob(target.float()).mean() * nb_samples_train \
+                    + kls[0] + nb_samples_train / entity_present.sum() * sum([torch.dot(kl[entity_present], 1 / entity_count[entity_present]) for kl in kls[1:]])
+            train_auc = -1
 
-        outputs, _ = model(X_test)
-        y_pred = outputs.sample().detach().cpu().numpy().clip(1, 5)
-        if epoch >= 5:
-            y_pred_all += y_pred
-        print('test pred')
-        for name, pred in zip(['this', 'all ', 'true'],
-                [y_pred[-5:], y_pred_all[-5:]/max(1, epoch-4), y_test_cpu[-5:].numpy()]):
-            print(name, ' '.join(f'{i:.4f}' for i in pred))
+            y_pred = outputs.mean.detach().cpu().numpy().clip(1, 5)
+
+            if not LBFGS:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            else:
+                progress.update(opt_task, completed=0)
+                optimizer.step(closure)
+
+            # print(y_pred.shape)
+            pred.extend(y_pred)
+            truth.extend(target.cpu())
+            losses.append(loss.item())
+            progress.update(batch_task, advance=1)
+
+        # End of epoch
         if OUTPUT_TYPE == 'reg':
-            test_rmse = mean_squared_error(y_test_cpu, y_pred) ** 0.5
-            all_rmse = mean_squared_error(y_test_cpu, y_pred_all / max(1, (epoch - 4))) ** 0.5
-            rmses['this'].append(test_rmse)
-            rmses['all'].append(all_rmse)
-            print('Test RMSE', test_rmse, 'All RMSE', all_rmse)
+            # print('truth pred', len(truth), len(pred), truth[:5], pred[:5])
+            train_rmse = mean_squared_error(truth, pred) ** 0.5
         else:
-            test_auc = roc_auc_score(y_test_cpu, y_pred)
-            test_map = average_precision_score(y_test_cpu, y_pred)
-            print(f'Test AUC {test_auc:.4f} Test MAP {test_map:.4f}')
-    progress.update(training, advance=1, elbo=np.mean(losses), test_rmse=test_rmse, all_rmse=all_rmse)
-    print(model.alpha)
+            train_auc = roc_auc_score(truth, pred)
+            train_map = average_precision_score(truth, pred)
+
+        '''print('test', outputs.sample()[:5], target[:5], loss.item())
+            print('variance', torch.sqrt(1 / model.alpha))
+            print('bias max abs', model.bias_params.weight.abs().max())
+            print('entity max abs', model.entity_params.weight.abs().max())'''
+
+        if epoch % DISPLAY_EPOCH_EVERY == 0:
+            print('train pred', np.round(pred[:5], 4), truth[:5])
+            print(f"Epoch {epoch}: Elbo {np.mean(losses):.4f} " +
+                  (f"Minibatch train RMSE {train_rmse:.4f}" if OUTPUT_TYPE == 'reg' else
+                   f"Minibatch train AUC {train_auc:.4f} " +
+                   f"Minibatch train MAP {train_map:.4f}"))
+
+            # print('precision', model.alpha, 'std dev', torch.sqrt(1 / model.alpha))
+            # print('bias max abs', model.bias_params.weight.abs().max())
+            # print('entity max abs', model.entity_params.weight.abs().max())
+
+            outputs, _ = model(X_test)
+            y_pred = outputs.sample().detach().cpu().numpy().clip(1, 5)
+            y_preds.append(y_pred)
+            nb_all = 1
+            if epoch >= 1000:
+                y_pred_all = np.sum(y_preds[-10:], axis=0)
+                nb_all = 10
+            elif epoch >= 0:
+                y_pred_all += y_pred
+                nb_all = epoch + 1
+            print('test pred')
+            for name, pred in zip(['this', 'all ', 'true'],
+                    [y_pred[-5:], y_pred_all[-5:]/nb_all, y_test_cpu[-5:].numpy()]):
+                print(name, ' '.join(f'{i:.4f}' for i in pred))
+            if OUTPUT_TYPE == 'reg':
+                test_rmse = mean_squared_error(y_test_cpu, y_pred) ** 0.5
+                all_rmse = mean_squared_error(y_test_cpu, y_pred_all / nb_all) ** 0.5
+                rmses['this'].append(test_rmse)
+                rmses['all'].append(all_rmse)
+                print('Test RMSE', test_rmse, 'All RMSE', all_rmse)
+            else:
+                test_auc = roc_auc_score(y_test_cpu, y_pred)
+                test_map = average_precision_score(y_test_cpu, y_pred)
+                print(f'Test AUC {test_auc:.4f} Test MAP {test_map:.4f}')
+        progress.update(training, advance=1, elbo=np.mean(losses), test_rmse=test_rmse, all_rmse=all_rmse)
+        print(model.alpha)
 
 plt.plot(rmses['this'], label='VFM this')
 plt.plot(rmses['all'], label='VFM all')
