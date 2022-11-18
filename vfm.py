@@ -84,7 +84,8 @@ link = tf.nn.softplus if options.link == 'softplus' else tf.math.abs
 
 
 # Load data
-if DATA in {'fraction', 'movie1M', 'movie10M', 'movie100k', 'movie100k-binary'}:
+if DATA in {'fraction', 'movie1M', 'movie10M', 'movie100k',
+    'movie100k-binary', 'movie1M-binary'}:
     df = pd.read_csv(DATA_PATH / 'data.csv')
     print('Starts at', df['user'].min(), df['item'].min())
     try:
@@ -119,7 +120,7 @@ else:
 if options.regression or 'rating' in df:
     is_regression = True
     is_classification = False
-if options.classification or 'outcome' in df:
+if DATA.endswith('binary') or (options.classification and 'outcome' in df):
     is_classification = True
     is_regression = False
 
@@ -160,8 +161,9 @@ nb_skills = X_fm.shape[1] - nb_users - nb_items
 # Set dataset indices (folds)
 i = {}
 try:
-    i['trainval'] = pd.read_csv(DATA_PATH / 'trainval.csv')['index'].tolist()
-    i['test'] = pd.read_csv(DATA_PATH / 'test.csv')['index'].tolist()
+    N, M, X_train, X_test, y_train, y_test, i = load_data(DATA)
+    # i['trainval'] = pd.read_csv(DATA_PATH / 'trainval.csv')['index'].tolist()
+    # i['test'] = pd.read_csv(DATA_PATH / 'test.csv')['index'].tolist()
     nb_users_test = len(i['test'])
     logging.warning('managed to load trainval/test')
     # i['train'], i['valid'] = train_test_split(i['trainval'], test_size=0.2, shuffle=True)
@@ -200,8 +202,9 @@ except Exception as e:
                 f.write('{:d} {:d}:1 {:d}:1\n'.format(rating, user, item))
 
     else:
-        i['trainval'], i['test'] = train_test_split(list(range(nb_entries)), test_size=0.2, shuffle=True)
-        i['train'], i['valid'] = train_test_split(i['trainval'], test_size=0.2, shuffle=True)
+        pass
+        # i['trainval'], i['test'] = train_test_split(list(range(nb_entries)), test_size=0.2, shuffle=True)
+        # i['train'], i['valid'] = train_test_split(i['trainval'], test_size=0.2, shuffle=True)
 
 
 X = {}
@@ -566,38 +569,42 @@ def define_variables(train_category, priors, batch_size, var_list=None):
                             wtfd.kl_divergence(q_uniq_item, emb_item_prior))'''
 
         # Objective function ELBO
-        elbo = (
+        logging.warning('parameters %d %d %d', nb_samples[train_category], nb_users, nb_iters)
+        elbo = (nb_samples[train_category] * (
             tf.reduce_mean(
                 likelihood.log_prob(outcomes)
-            )
-        - tf.reduce_mean(
+            ))
+        # nb_samples[train_category] / (nb_users) * nb_iters
+        - nb_samples[train_category] * tf.reduce_mean(
+            # uniq_user_rescale
             1 / uniq_user_rescale * (wtfd.kl_divergence(q_uniq_user_bias, bias_user_prior) +
                                 wtfd.kl_divergence(q_uniq_user, emb_user_prior))
         )
-        - tf.reduce_mean(
+        # nb_samples[train_category] / (nb_items) * nb_iters
+        - nb_samples[train_category] * tf.reduce_mean(
+            # uniq_item_rescale
             1 / uniq_item_rescale * (wtfd.kl_divergence(q_uniq_item_bias, bias_item_prior) +
                                 wtfd.kl_divergence(q_uniq_item, emb_item_prior))
         )
-        + (
+        - (
             global_bias_prior.log_prob(global_bias)
             + emb_user_mu0.log_prob(emb_user_mu) + tf.reduce_sum(precision_prior.log_prob(emb_user_lambda))
             + emb_item_mu0.log_prob(emb_item_mu) + tf.reduce_sum(precision_prior.log_prob(emb_item_lambda))
             + bias_user_mu0.log_prob(bias_user_mu) + precision_prior.log_prob(bias_user_lambda)
             + bias_item_mu0.log_prob(bias_item_mu) + precision_prior.log_prob(bias_item_lambda)
             + precision_prior.log_prob(alpha)
-        ) / nb_samples[train_category]
-        )
+        )) #/ nb_samples[train_category]
 
         # many_feats = q_user.sample(100)
 
     sentinel = {
-        'nb outcomes': tf.shape(outcomes),
-        'nb samples': tf.constant(nb_samples[train_category]),
-        'user batch': user_batch,
-        'uniq_user': uniq_user_rescale,
-        'uniq_item': uniq_item_rescale,
-        # 'user_batch': len(user_batch),
-        # 'user unique batch': len(tf.unique(user_batch)),
+        # 'nb outcomes': tf.shape(outcomes),
+        # 'nb samples': tf.constant(nb_samples[train_category]),
+        # 'user batch': user_batch,
+        # 'uniq_user': uniq_user_rescale,
+        # 'uniq_item': uniq_item_rescale,
+        'user_batch': tf.shape(user_batch),
+        'user unique batch': tf.shape(tf.unique(user_batch)[0]),
         # 'nb_occ': nb_occ,
         # 'p - q': emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users),
         # 'many p - q': tf.reduce_mean(emb_user_prior.log_prob(many_feats) - q_user.log_prob(many_feats), axis=0),
@@ -628,14 +635,14 @@ def define_variables(train_category, priors, batch_size, var_list=None):
         # 'bias sample': bias_users[0],
         # 'bias log prob': -bias_user_prior.log_prob(bias_users)[0],
         # 'sum bias log prob': -tf.reduce_sum(bias_user_prior.log_prob(bias_users)),
-        'likelihood (outcomes)': tf.shape(likelihood.log_prob(outcomes)),
-        'pred': pred,
-        'pred shape': tf.shape(pred),
-        'mean pred': pred_mean,
-        'mean pred shape': tf.shape(pred_mean),
+        # 'likelihood (outcomes)': tf.shape(likelihood.log_prob(outcomes)),
+        # 'pred': pred,
+        # 'pred shape': tf.shape(pred),
+        # 'mean pred': pred_mean,
+        # 'mean pred shape': tf.shape(pred_mean),
         # 'pred2': pred2,
-        'max pred': tf.reduce_max(pred),
-        'min pred': tf.reduce_min(pred),
+        # 'max pred': tf.reduce_max(pred),
+        # 'min pred': tf.reduce_min(pred),
         # 'max pred2': tf.reduce_max(pred2),
         # 'min pred2': tf.reduce_min(pred2),
         # 'has nan': tf.reduce_any(tf.is_nan(pred2))
@@ -726,7 +733,7 @@ class VFM:
         self.optimized_vars = optimized_vars
         self.nb_batches = nb_batches
         self.strategy = ''
-        self.all_preds = []
+        self.all_preds = defaultdict(list)
         self.init_train()
 
     def reset(self, strategy='random'):
@@ -805,8 +812,9 @@ class VFM:
             print('[%s] pred' % category, y_truth[:5], y_pred[:5])
         if len(self.metrics[category]['epoch']) == 0 or self.metrics[category]['epoch'][-1] != epoch:
             self.metrics[category]['epoch'].append(epoch)
-        self.all_preds.append(y_pred.tolist())
-        mean_pred = np.array(self.all_preds).mean(axis=0)
+        self.all_preds[category].append(y_pred.tolist())
+        # print(np.array(self.all_preds).shape, [len(term) for term in self.all_preds])
+        mean_pred = np.array(self.all_preds[category]).mean(axis=0)
         self.metrics[category]['acc'].append(np.mean(y_truth == np.round(y_pred)))
         self.metrics[category]['acc_all'].append(np.mean(y_truth == np.round(mean_pred)))
         # print('shape', mean_pred.shape)
@@ -848,6 +856,7 @@ class VFM:
         plot_after(data, save_to_path)
         with open(save_to_path, 'w') as f:
             f.write(json.dumps(data, indent=4))
+        logging.warning('execute python rule.py %s', save_to_path)
         os.system(f'python rule.py {save_to_path}')
 
     def plot(self, category):
@@ -905,7 +914,7 @@ class VFM:
             tf.constant(nb_occurrences[training_set_name][:, None].repeat(
                 embedding_size, axis=1), dtype=np.float32), 1, 1000000)
         with tf.variable_scope(self.model_name()):
-            self.infer_op, self.elbo, self.pred, self.likelihood, sentinel = define_variables(
+            self.infer_op, self.elbo, self.pred, self.likelihood, self.sentinel = define_variables(
                 training_set_name, priors, self.batch_size,
                 self.optimized_vars)
 
@@ -952,8 +961,10 @@ class VFM:
                     train_elbo = sess.run(elbo, feed_dict=make_feed('batch'))
 
                 if VERBOSE >= 100:
-                    values = sess.run([sentinel[key] for key in sentinel], feed_dict=make_feed('batch'))
-                    for key, val in zip(sentinel, values):
+                    print(self.sentinel)
+                    for key in self.sentinel:
+                        print(key)
+                        val = sess.run(self.sentinel[key], feed_dict=make_feed('batch'))
                         print(key, val)
                     # sys.exit(0)
 

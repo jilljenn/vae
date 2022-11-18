@@ -37,6 +37,7 @@ mcmc = {
     'movie100k': LIBFM_RESULTS_PATH / 'mcmc_100k.csv',
     'movie100k-binary': LIBFM_RESULTS_PATH / 'mcmc_100k_binary.csv',
     'movie1M': LIBFM_RESULTS_PATH / 'mcmc_1M',
+    'movie1M-binary': LIBFM_RESULTS_PATH / 'mcmc_1M_binary.csv',
     'movie10M': LIBFM_RESULTS_PATH / 'mcmc_10M'
 }
 
@@ -45,7 +46,9 @@ with open(log_name) as f:
     data = json.load(f)
 
 dataset = data['args']['data']
-metric_name = 'acc' if dataset in {'fraction', 'movie5', 'movie20', 'movie100', 'movie100k-binary'} else 'rmse'
+metric_name = 'acc' if dataset in {
+    'fraction', 'movie5', 'movie20', 'movie100',
+    'movie100k-binary', 'movie1M-binary'} else 'rmse'
 CPP_METRIC = f'{metric_name}_mcmc_this'
 
 train_epochs = np.unique(sorted(data['metrics']['train']['epoch']))
@@ -99,7 +102,7 @@ if metric_name in data['metrics']['train']:
 metric.plot(data['metrics']['test']['epoch'], data['metrics']['test'][metric_name], label='VFM this')
 if 'rmse_all' in data['metrics']['test']:
     metric.plot(data['metrics']['test']['epoch'], data['metrics']['test']['rmse_all'], label='VFM all')
-if 'acc_all' in data['metrics']['test']:
+elif 'acc_all' in data['metrics']['test']:
     metric.plot(data['metrics']['test']['epoch'], data['metrics']['test']['acc_all'], label='VFM all')
 
 # print('VFM', data['metrics']['test'][metric_name])
@@ -150,6 +153,6 @@ metric.legend()
 if metric_name == 'rmse':
     metric.set_ylim(ymax=1.2)
 # fig.legend()
-fig.savefig('{:s}'.format(fig_name_png, format='png'))
-fig.savefig('{:s}'.format(fig_name, format='pdf'))
+fig.savefig('{:s}'.format(fig_name_png, format='png', bbox_inches='tight'))
+fig.savefig('{:s}'.format(fig_name, format='pdf', bbox_inches='tight'))
 os.system('open {:s}'.format(fig_name))
