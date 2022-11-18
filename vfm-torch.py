@@ -15,15 +15,20 @@ from prepare import load_data
 torch.manual_seed(42)
 
 LEARNING_RATE = 0.1
-EMBEDDING_SIZE = 20
+# LEARNING_RATE = 1
+EMBEDDING_SIZE = 3
 N_VARIATIONAL_SAMPLES = 1
-OUTPUT_TYPE = 'reg'
 
 
 # DATA = 'toy'
 # DATA = 'movielens'
 # DATA = 'movie100k'
 DATA = 'movie100k'
+OUTPUT_TYPE = 'reg'
+if DATA.endswith('binary'):
+    OUTPUT_TYPE = 'class'
+
+
 if DATA == 'movie100':
     N_EPOCHS = 100
     DISPLAY_EPOCH_EVERY = 5
@@ -69,8 +74,9 @@ else:
         y = torch.Tensor(df['rating'])
     elif DATA.startswith('movie100k'):
         N_EPOCHS = 50
-        DISPLAY_EPOCH_EVERY = 2
+        DISPLAY_EPOCH_EVERY = 1
         BATCH_SIZE = 800
+        # BATCH_SIZE = 100000
         '''df = pd.read_csv('data/movie100k/data.csv')#.head(1000)
                                 if DATA.endswith('batch'):
                                     N_EPOCHS = 100
@@ -79,7 +85,7 @@ else:
         # films = pd.read_csv('ml-latest-small/movies.csv')
         # df = df.merge(films, on='movieId')
 
-        N, M, X_train, X_test, y_train, y_test = load_data('movie100k')
+        N, M, X_train, X_test, y_train, y_test = load_data(DATA, OUTPUT_TYPE)
         X_train = torch.LongTensor(X_train)
         y_train = torch.Tensor(y_train)
         X_test = torch.LongTensor(X_test)
@@ -122,24 +128,52 @@ class CF(nn.Module):
         super().__init__()
         self.output = output
         self.alpha = nn.Parameter(torch.Tensor([1e9]), requires_grad=True)
-        self.global_bias = nn.Parameter(torch.Tensor([0.]), requires_grad=True)
+        self.global_bias_mean = nn.Parameter(torch.Tensor([0.]), requires_grad=True)
+        self.global_bias_scale = nn.Parameter(torch.Tensor([1.]), requires_grad=True)
+        self.prec_global_bias_prior = nn.Parameter(torch.Tensor([1.]), requires_grad=True)
+        self.prec_user_bias_prior = nn.Parameter(torch.Tensor([1.]), requires_grad=True)
+        self.prec_item_bias_prior = nn.Parameter(torch.Tensor([1.]), requires_grad=True)
+        self.prec_user_entity_prior = nn.Parameter(torch.Tensor([1.] * EMBEDDING_SIZE), requires_grad=True)
+        self.prec_item_entity_prior = nn.Parameter(torch.Tensor([1.] * EMBEDDING_SIZE), requires_grad=True)
         # self.alpha = torch.Tensor([1.])
-        # nn.init.uniform_(self.alpha)
+        nn.init.uniform_(self.alpha)
         self.bias_params = nn.Embedding(N + M, 2)  # w
         self.entity_params = nn.Embedding(N + M, 2 * embedding_size)  # V
+        self.global_bias_prior = distributions.normal.Normal(
+            torch.Tensor([0.]), torch.nn.functional.softplus(self.prec_global_bias_prior))
         self.bias_prior = distributions.normal.Normal(
-            torch.Tensor([0.]), torch.Tensor([1.]))
+            torch.zeros(N + M),
+            torch.nn.functional.softplus(torch.cat(
+                self.prec_user_bias_prior.repeat(N),
+                self.prec_item_bias_prior.repeat(M)
+            ))
+        )
+        self.entity_prior = distributions.normal.Normal(
+            torch.zeros(N + M, EMBEDDING_SIZE),
+            torch.nn.functional.softplus(torch.cat(
+                self.prec_user_entity_prior.repeat(N),
+                self.prec_item_entity_prior.repeat(M)
+            ))
+        )
+        # self.bias_prior = distributions.normal.Normal(
+        #     torch.Tensor([0.]), torch.Tensor([1.]))
         self.entity_prior = distributions.multivariate_normal.MultivariateNormal(
             torch.zeros(embedding_size), scale_tril=torch.eye(embedding_size))
 
     def forward(self, x):
+        # Global bias
+        global_bias_sampler = distributions.normal.Normal(
+            self.global_bias_mean,
+            nn.functional.softplus(self.global_bias_scale)
+        )
+        # Biases and entities
         bias_batch = self.bias_params(x).reshape(-1, 2)
         entity_batch = self.entity_params(x).reshape(-1, 2 * EMBEDDING_SIZE)
         # print('first', bias_batch.shape, entity_batch.shape)
         scale_bias = nn.functional.softplus(bias_batch[:, 1])
         # scale_bias = torch.ones_like(scale_bias) * 1e-6
         bias_sampler = distributions.normal.Normal(
-            bias_batch[:, 0], scale_bias)
+            bias_batch[:, 0], scale_bias)  # Too many batches
         diag_scale_entity = nn.functional.softplus(entity_batch[:, EMBEDDING_SIZE:])
         # diag_scale_entity = torch.ones_like(diag_scale_entity) * 1e-6
         scale_entity = torch.diag_embed(diag_scale_entity)
@@ -164,13 +198,23 @@ class CF(nn.Module):
         else:
             likelihood = distributions.bernoulli.Bernoulli(logits=unscaled_pred)
         return (likelihood,
-            distributions.kl.kl_divergence(bias_sampler, self.bias_prior),
+            distributions.kl.kl_divergence(global_bias_sampler, self.global_bias_prior) +
+            distributions.kl.kl_divergence(bias_sampler, self.bias_prior) +
             distributions.kl.kl_divergence(entity_sampler, self.entity_prior))
+
+
+def closure():
+    optimizer.zero_grad()
+    outputs, kl_bias, kl_entity = model(indices)
+    obj = -outputs.log_prob(target.float()).mean() + kl_bias.mean() + kl_entity.mean()
+    obj.backward()
+    return obj
 
 
 model = CF(EMBEDDING_SIZE, output=OUTPUT_TYPE)
 mse_loss = nn.MSELoss()
-optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
+optimizer = torch.optim.Adam(model.parameters(), lr=LEARNING_RATE)#, weight_decay=1e-4)
+# optimizer = torch.optim.LBFGS(model.parameters(), lr=LEARNING_RATE, history_size=10, max_iter=4, line_search_fn='strong_wolfe')
 # optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE)
 train_rmse = train_auc = train_map = 0.
 losses = []
@@ -179,9 +223,7 @@ for epoch in tqdm(range(N_EPOCHS)):
     pred = []
     truth = []
     for indices, target in train_iter:
-        # with torch.autograd.detect_anomaly():
         outputs, kl_bias, kl_entity = model(indices)#.squeeze()
-        # print(outputs.shape)
         # loss = loss_function(outputs, target)
         # print('kl', kl_bias.shape, kl_entity.shape)
         # print(outputs.sample()[:5], target[:5])
@@ -192,13 +234,14 @@ for epoch in tqdm(range(N_EPOCHS)):
         loss.backward()
         optimizer.step()
 
-        y_pred = outputs.mean.detach().numpy().clip(1, 5)
+        y_pred = outputs.mean.detach().numpy()
         pred.extend(y_pred)
         truth.extend(target)
         losses.append(loss.item())
 
     # End of epoch
     if OUTPUT_TYPE == 'reg':
+        pred = np.clip(pred, 1, 5)
         train_rmse = mean_squared_error(truth, pred) ** 0.5
     else:
         train_auc = roc_auc_score(truth, pred)
@@ -216,14 +259,15 @@ for epoch in tqdm(range(N_EPOCHS)):
                f"Minibatch train AUC {train_auc:.4f} " +
                f"Minibatch train MAP {train_map:.4f}"))
 
-        # print('precision', model.alpha, 'std dev', torch.sqrt(1 / model.alpha))
+        print('precision', model.alpha, 'std dev', torch.sqrt(1 / nn.functional.softplus(model.alpha)))
         # print('bias max abs', model.bias_params.weight.abs().max())
         # print('entity max abs', model.entity_params.weight.abs().max())
 
         outputs, _, _ = model(X_test)
-        y_pred = outputs.mean.detach().numpy().clip(1, 5)
+        y_pred = outputs.mean.detach().numpy()
         print('test pred', np.round(y_pred[-5:], 4), y_test[-5:])    
         if OUTPUT_TYPE == 'reg':
+            y_pred = y_pred.clip(1, 5)
             test_rmse = mean_squared_error(y_test, y_pred) ** 0.5
             print('Test RMSE', test_rmse)
         else:
