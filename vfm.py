@@ -49,14 +49,15 @@ parser.add_argument('--load', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--single_user', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--split_valid', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--interactive', type=bool, nargs='?', const=True, default=False)
+parser.add_argument('--valid-only', type=bool, nargs='?', const=True, default=False)
 
 parser.add_argument('--valid_patience', type=int, nargs='?', default=4)
 parser.add_argument('--train_patience', type=int, nargs='?', default=6)
 parser.add_argument('--d', type=int, nargs='?', default=3)
-parser.add_argument('--lr', type=float, nargs='?', default=0.1)
+# parser.add_argument('--lr', type=float, nargs='?', default=0.1)
 parser.add_argument('--nb_batches', type=int, nargs='?', default=1)
 parser.add_argument('--min_epochs', type=int, nargs='?', default=0)
-parser.add_argument('--max_epochs', type=int, nargs='?', default=200)
+parser.add_argument('--max_epochs', type=int, nargs='?', default=400)
 parser.add_argument('--var_samples', type=int, nargs='?', default=1)
 parser.add_argument('--method', type=str, nargs='?', default='adam')
 parser.add_argument('--link', type=str, nargs='?', default='softplus')
@@ -71,15 +72,15 @@ DATA_PATH = Path('data') / DATA
 logging.warning('Data is %s', DATA)
 VERBOSE = options.v
 NB_VARIATIONAL_SAMPLES = options.var_samples
-COMPUTE_TEST_EVERY = 1
-COMPUTE_VALID_EVERY = 5
 N_QUESTIONS_ASKED = 20
 TRAIN_EVERY_N_QUESTIONS = 4
 MIN_EPOCHS = options.min_epochs
 MAX_EPOCHS = options.max_epochs
+COMPUTE_VALID_EVERY = 1
+COMPUTE_TEST_EVERY = 1 if not options.valid_only else MAX_EPOCHS + 1
 embedding_size = options.d
 nb_iters = options.nb_batches
-learning_rate = options.lr  # learning_rate 0.001 works better for classification
+learning_rate = 1 / nb_iters  # learning_rate 0.001 works better for classification
 if options.classification:
     learning_rate = 0.1
 link = tf.nn.softplus if options.link == 'softplus' else tf.math.abs
@@ -503,11 +504,12 @@ def define_variables(train_category, priors, batch_size, var_list=None):
     # ll = make_likelihood(feat_users2, feat_items2, bias_users2, bias_items2)
     pred = tf.reduce_mean(likelihood.mean(), axis=0)  # À cause du nombre de variational samples
     # pred = tf.reduce_mean(likelihood.sample(), axis=0)  # Sampling instead of mean is worse
-    pred_mean = global_bias + tf.reduce_sum(mean_feat_users * mean_feat_items, 1) + mean_bias_users + mean_bias_items
+    pred_of_mean = global_bias + tf.reduce_sum(mean_feat_users * mean_feat_items, 1) + mean_bias_users + mean_bias_items
     if is_classification:
-        pred_mean = tf.sigmoid(pred_mean)
+        pred_of_mean = tf.sigmoid(pred_of_mean)
     else:
         pred = tf.clip_by_value(pred, 1, 5)
+        pred_of_mean = tf.clip_by_value(pred_of_mean, 1, 5)
     # pred_mean = pred in regression but not in classification
 
     # likelihood_var = make_likelihood_reg(sigma2, q_user, q_item, q_user_bias, q_item_bias)
@@ -586,16 +588,16 @@ def define_variables(train_category, priors, batch_size, var_list=None):
         # nb_users * 
         - tf.reduce_mean(
             # uniq_user_rescale
-            1 / uniq_user_rescale * (wtfd.kl_divergence(q_uniq_user_bias, bias_user_prior) +
-                                wtfd.kl_divergence(q_uniq_user, emb_user_prior))
+            1 / user_rescale * (wtfd.kl_divergence(q_user_bias, bias_user_prior) +
+                                wtfd.kl_divergence(q_user, emb_user_prior))
         ) #/ nb_samples[train_category]
         # nb_samples[train_category] / (nb_items) * nb_iters
         # nb_samples[train_category]
         # nb_users * 
         - tf.reduce_mean(
             # uniq_item_rescale
-            1 / uniq_item_rescale * (wtfd.kl_divergence(q_uniq_item_bias, bias_item_prior) +
-                                wtfd.kl_divergence(q_uniq_item, emb_item_prior))
+            1 / item_rescale * (wtfd.kl_divergence(q_item_bias, bias_item_prior) +
+                                wtfd.kl_divergence(q_item, emb_item_prior))
         ) #/ nb_samples[train_category]
         - (
             global_bias_prior.log_prob(global_bias)
@@ -614,13 +616,13 @@ def define_variables(train_category, priors, batch_size, var_list=None):
         # 'user batch': user_batch,
         # 'uniq_user': uniq_user_rescale,
         # 'uniq_item': uniq_item_rescale,
-        'user_batch': tf.shape(user_batch),
-        'user unique batch': tf.shape(tf.unique(user_batch)[0]),
+        # 'user_batch': tf.shape(user_batch),
+        # 'user unique batch': tf.shape(tf.unique(user_batch)[0]),
         # 'nb_occ': nb_occ,
         # 'p - q': emb_user_prior.log_prob(feat_users) - q_user.log_prob(feat_users),
         # 'many p - q': tf.reduce_mean(emb_user_prior.log_prob(many_feats) - q_user.log_prob(many_feats), axis=0),
-        'kl attendu': tf.shape(wtfd.kl_divergence(q_uniq_user, emb_user_prior)),
-        'kl attendu aussi': tf.shape(wtfd.kl_divergence(q_uniq_user_bias, bias_user_prior)),
+        # 'kl attendu': tf.shape(wtfd.kl_divergence(q_uniq_user, emb_user_prior)),
+        # 'kl attendu aussi': tf.shape(wtfd.kl_divergence(q_uniq_user_bias, bias_user_prior)),
         # 'lplq': relevant_scaled_lp_lq,
         # 'batch ll log prob': nb_samples['train'] * tf.reduce_mean(likelihood.log_prob(outcomes)),
         # 'll log prob shape': tf.shape(likelihood.log_prob(outcomes)),
@@ -647,9 +649,9 @@ def define_variables(train_category, priors, batch_size, var_list=None):
         # 'bias log prob': -bias_user_prior.log_prob(bias_users)[0],
         # 'sum bias log prob': -tf.reduce_sum(bias_user_prior.log_prob(bias_users)),
         # 'likelihood (outcomes)': tf.shape(likelihood.log_prob(outcomes)),
-        # 'pred': pred,
+        'pred': pred,
         # 'pred shape': tf.shape(pred),
-        # 'mean pred': pred_mean,
+        'mean pred': pred_of_mean,
         # 'mean pred shape': tf.shape(pred_mean),
         # 'pred2': pred2,
         # 'max pred': tf.reduce_max(pred),
@@ -669,7 +671,7 @@ def define_variables(train_category, priors, batch_size, var_list=None):
     if options.sparse:
         return infer_op, elbo, pred2, likelihood, sentinel
     else:
-        return infer_op, elbo, pred, likelihood, sentinel
+        return infer_op, elbo, pred, pred_of_mean, likelihood, sentinel
 
 # elbo4 = (# nb_samples['train'] * tf.reduce_mean(ll.log_prob(outcomes)) +
 #         nb_samples['train'] * sparse_pred.log_prob(outcomes) +
@@ -745,6 +747,7 @@ class VFM:
         self.nb_batches = nb_batches
         self.strategy = ''
         self.all_preds = defaultdict(list)
+        self.all_preds_of_mean = defaultdict(list)
         self.init_train()
 
     def reset(self, strategy='random'):
@@ -777,7 +780,8 @@ class VFM:
         """
         state = self.__dict__.copy()
         del state['start_time']
-        del state['pred'], state['all_preds']
+        del state['pred'], state['pred_of_mean']
+        del state['all_preds'], state['all_preds_of_mean']
         del state['elbo'], state['likelihood']
         del state['infer_op'], state['sentinel']
         '''for key, value in state.items():
@@ -826,13 +830,13 @@ class VFM:
             rounding = 4
         else:
             length = self.valid_patience
-            rounding = 3
+            rounding = 5
         if self.epoch < MIN_EPOCHS:
             return False, []
         if self.epoch > MAX_EPOCHS:
             return True, []
         # If these metrics decrease, it's worse
-        should_not_decrease = self.metric_watcher in {'acc', 'auc', 'elbo'}
+        should_not_decrease = self.metric_watcher in {'acc', 'auc', 'elbo', 'auc_all'}
         # if self.category_watcher == 'train':
         latest_values = np.round(self.metrics[self.category_watcher][
             self.metric_watcher][-length:], rounding).tolist()
@@ -854,17 +858,19 @@ class VFM:
         quotient = gen_loss / progress
         return quotient > 0.2, valid[-2:]
 
-    def save_metrics(self, category, epoch, y_truth, y_pred):
+    def save_metrics(self, category, epoch, y_truth, y_pred, y_pred_of_mean):
         if VERBOSE > 100:
             print('[%s] pred' % category, y_truth[:5], y_pred[:5])
         if len(self.metrics[category]['epoch']) == 0 or self.metrics[category]['epoch'][-1] != epoch:
             self.metrics[category]['epoch'].append(epoch)
         # print('hey', category, y_pred.shape)
         self.all_preds[category].append(y_pred.tolist())
+        self.all_preds_of_mean[category].append(y_pred_of_mean.tolist())
         # print(self.all_preds)
         # print(np.array(self.all_preds).shape, [len(term) for term in self.all_preds[category]])
         if category != 'train':
             mean_pred = np.array(self.all_preds[category]).mean(axis=0)
+            mean_pred_of_mean = np.array(self.all_preds_of_mean[category]).mean(axis=0)
         self.metrics[category]['acc'].append(np.mean(y_truth == np.round(y_pred)))
         if category != 'train':
             self.metrics[category]['acc_all'].append(np.mean(y_truth == np.round(mean_pred)))
@@ -883,6 +889,7 @@ class VFM:
             self.metrics[category]['rmse'].append(mean_squared_error(y_truth, y_pred) ** 0.5)
             if category != 'train':
                 self.metrics[category]['rmse_all'].append(mean_squared_error(y_truth, mean_pred) ** 0.5)
+                self.metrics[category]['rmse_all_of_mean'].append(mean_squared_error(y_truth, mean_pred_of_mean) ** 0.5)
         if VERBOSE:
             for metric in self.metrics[category]:
                 if not self.metrics[category][metric]:
@@ -894,12 +901,12 @@ class VFM:
 
     def run_and_save(self, category):
         # print('makefeed', category, self.data[category], make_feed(self.data[category]))
-        valid_pred = sess.run(self.pred, feed_dict=make_feed(self.data[category]))
+        valid_pred, valid_pred_of_mean = sess.run([self.pred, self.pred_of_mean], feed_dict=make_feed(self.data[category]))
         # print(sess.run(entity))
         # print(sess.run(bias))
         # print(sess.run(global_bias))
         # print(valid_pred)
-        self.save_metrics(category, self.epoch, y[self.data[category]], valid_pred)
+        self.save_metrics(category, self.epoch, y[self.data[category]], valid_pred, valid_pred_of_mean)
 
     def save_logs(self):
         filename = '{:s}-{:d}.txt'.format(self.model_name(), int(round(time.time())))
@@ -917,8 +924,9 @@ class VFM:
         plot_after(data, save_to_path)
         with open(save_to_path, 'w') as f:
             f.write(json.dumps(data, indent=4))
-        logging.warning('execute python rule.py %s', save_to_path)
-        os.system(f'python rule.py {save_to_path}')
+        if not options.valid_only:
+            logging.warning('execute python rule.py %s', save_to_path)
+            os.system(f'python rule.py {save_to_path}')
 
     def plot(self, category):
         plt.clf()
@@ -975,7 +983,7 @@ class VFM:
             tf.constant(nb_occurrences[training_set_name][:, None].repeat(
                 embedding_size, axis=1), dtype=np.float32), 1, 1000000)
         with tf.variable_scope(self.model_name()):
-            self.infer_op, self.elbo, self.pred, self.likelihood, self.sentinel = define_variables(
+            self.infer_op, self.elbo, self.pred, self.pred_of_mean, self.likelihood, self.sentinel = define_variables(
                 training_set_name, priors, self.batch_size,
                 self.optimized_vars)
 
@@ -1114,21 +1122,24 @@ if __name__ == '__main__':
 
         if not options.load:
             # EMBEDDING_SIZES = [2, 10]
-            NB_BATCHES_CANDIDATES = [1]
-            if len(NB_BATCHES_CANDIDATES) > 1:
+            NB_BATCHES_CANDIDATES = [nb_iters]
+            if len(NB_BATCHES_CANDIDATES) and options.valid_only:
                 for nb_batches in NB_BATCHES_CANDIDATES:
                     valid_metrics = []
                     vfm = VFM('train', 'valid', nb_batches=nb_batches,
-                        stop_when_worse=('valid', 'all_auc' if is_classification else 'rmse_all'))
+                        stop_when_worse=('valid', 'auc_all' if is_classification else 'rmse_all'))
                     valid_metric = vfm.train()
+                    logging.warning('Validation metric %.5f after %d epochs for d=%d', valid_metric, vfm.epoch, embedding_size)
+                    vfm.save_model()
                     valid_metrics.append(valid_metric)
                 best_nb_batches = NB_BATCHES_CANDIDATES[np.argmin(valid_metrics)]
             else:
                 best_nb_batches = NB_BATCHES_CANDIDATES[0]
 
-            refit = VFM('trainval', nb_batches=best_nb_batches)
-            refit.train()
-            refit.save_model()  # Beware of RLock
+            if not options.valid_only:
+                refit = VFM('trainval', nb_batches=best_nb_batches)
+                refit.train()
+                refit.save_model()  # Beware of RLock
         else:
             logging.warning('checksum %f', data['other_entities:0'].sum())
             # sys.exit(0)
