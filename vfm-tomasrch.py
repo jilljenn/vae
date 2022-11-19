@@ -2,6 +2,8 @@
 Matrix completion on toy and Movielens datasets
 JJV for Deep Learning course, 2022
 """
+import numpy as np
+
 import torch
 from torch import nn, distributions
 from torch.utils.tensorboard import SummaryWriter
@@ -18,7 +20,7 @@ from torchmin import Minimizer
 # from torch.profiler import profile, record_function, ProfilerActivity
 
 torch.manual_seed(42)
-device = torch.device('cuda')  # cuda
+device = torch.device('cpu')  # cuda
 
 def draw_graph(start, watch=[]):
     from graphviz import Digraph
@@ -128,7 +130,7 @@ else:
         X = torch.LongTensor(df[['user', 'item']].to_numpy())
         y = torch.Tensor(df['rating'])
     elif DATA.startswith('movie100k'):
-        N_EPOCHS = 200
+        N_EPOCHS = 500
         DISPLAY_EPOCH_EVERY = 1
         BATCH_SIZE = 800
         BATCH_SIZE = 8000
@@ -141,7 +143,7 @@ else:
         # films = pd.read_csv('ml-latest-small/movies.csv')
         # df = df.merge(films, on='movieId')
 
-        N, M, X_train, X_test, y_train, y_test = load_data('movie100k')
+        N, M, X_train, X_test, y_train, y_test, _ = load_data('movie100k')
         nb_samples_train = len(X_train)
         X_train = torch.LongTensor(X_train)
         y_train = torch.Tensor(y_train)
@@ -182,6 +184,8 @@ train_iter = torch.utils.data.DataLoader(
 
 all_entities = torch.arange(start=0, end=N+M, device=device)
 entity_count = torch.bincount(X_train.flatten()).float()
+
+eps = 1e-9
 
 class CF(nn.Module):
     """
@@ -296,7 +300,7 @@ class CF(nn.Module):
         self.entity_sampler = distributions.normal.Normal(
             entity_params[:, :self.embedding_size],
             # nn.functional.softplus(entity_params[:, self.embedding_size:]),
-            torch.abs(entity_params[:, self.embedding_size:])
+            torch.abs(entity_params[:, self.embedding_size:]) + eps
         )
 
         # self.global_bias = self.global_bias_sampler.rsample((self.n_var_samples,)).squeeze(dim=1)
@@ -650,7 +654,7 @@ def run(lr=0.02, alpha_0=300, embedding_size=2, n_var_samples=1):
     ax3.legend()
     fig.savefig(f'VFMrmses_{all_rmse:.4f}.png')
 
-    return all_rmse
+    return test_rmse
 
 # if DATA == 'movielens':
 #     writer = SummaryWriter(log_dir='logs/embeddings')  # TBoard
@@ -668,13 +672,12 @@ OUTPUT_TYPE = 'reg'
 LBFGS = False
 
 LEARNING_RATE = 1. / len(train_iter)
-alpha_0 = 1. # len(train_iter)
-EMBEDDING_SIZE = 20
+alpha_0 = 0.5 * len(train_iter)
+EMBEDDING_SIZE = 12
 N_VARIATIONAL_SAMPLES = 1
 
-best_rmse = 0.9396829816151417
-
-import numpy as np
+best_lr, best_a0, best_es = float('nan'), float('nan'), float('nan')
+best_rmse = float('inf')
 
 search_size = 5
 
@@ -709,27 +712,27 @@ with Progress(
 
     # ress = []
     # XX = []
-    # for lr in 10 ** np.linspace(-2, -1.3, search_size):
-    #     ress.append([])
-    #     XX.append([])
-    #     for a0 in 10 ** np.linspace(1, 2.3, search_size):
-    #         progress.update(task, elbo=lr, test_rmse=a0, all_rmse=best_rmse)
-    #         loss = run(lr=lr, alpha_0=a0, embedding_size=EMBEDDING_SIZE,
-    #             n_var_samples=N_VARIATIONAL_SAMPLES)
-    #         if loss < best_rmse:
-    #             best_rmse = loss
-    #             LEARNING_RATE = lr
-    #             alpha_0 = a0
-    #             EMBEDDING_SIZE = EMBEDDING_SIZE
-    #             N_VARIATIONAL_SAMPLES = N_VARIATIONAL_SAMPLES
-    #         ress[-1].append(loss)
-    #         XX[-1].append((lr, a0))
-    #         progress.update(task, advance=1)
-    #         progress.reset(training)
+    # for es in range(1, 21):
+    #     # ress.append([])
+    #     # XX.append([])
+    #     # for a0 in 10 ** np.linspace(-0.3, 0.3, search_size):
+    #     progress.update(task, elbo=best_es, all_rmse=best_rmse)
+    #     loss = run(lr=LEARNING_RATE, alpha_0=alpha_0,
+    #         embedding_size=es,
+    #         n_var_samples=N_VARIATIONAL_SAMPLES)
+    #     if loss < best_rmse:
+    #         best_rmse = loss
+    #         # best_lr = lr
+    #         # best_a0 = a0
+    #         best_es = es
+    #     ress.append(loss)
+    #     XX.append(es)
+    #     progress.update(task, advance=1)
+    #     progress.reset(training)
     # print(ress)
     # print(XX)
 
-# print(best_rmse, LEARNING_RATE, alpha_0, EMBEDDING_SIZE, N_VARIATIONAL_SAMPLES)
+# print(best_rmse, best_es, EMBEDDING_SIZE, N_VARIATIONAL_SAMPLES)
 
 
 
