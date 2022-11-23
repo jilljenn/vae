@@ -11,6 +11,8 @@ def load_data(DATA, output_type='reg'):
     i = {}
     DATA_PATH = Path('data') / DATA
     df = pd.read_csv(DATA_PATH / 'data.csv')
+    if 'shifted_item' not in df.columns:
+        df['shifted_item'] = df['item']
     i['trainval'] = pd.read_csv(DATA_PATH / 'trainval.csv')['index'].tolist()
     i['test'] = pd.read_csv(DATA_PATH / 'test.csv')['index'].tolist()
     outcome_column = 'rating' if output_type == 'reg' else 'outcome'
