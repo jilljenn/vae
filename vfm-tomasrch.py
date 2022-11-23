@@ -22,70 +22,12 @@ from torchmin import Minimizer
 torch.manual_seed(42)
 device = torch.device('cpu')  # cuda
 
-def draw_graph(start, watch=[]):
-    from graphviz import Digraph
-    node_attr = dict(style='filled',
-                    shape='box',
-                    align='left',
-                    fontsize='12',
-                    ranksep='0.1',
-                    height='0.2')
-    graph = Digraph(node_attr=node_attr, graph_attr=dict(size="12,12"))
-    assert(hasattr(start, "grad_fn"))
-    if start.grad_fn is not None:
-        _draw_graph(start.grad_fn, graph, watch=watch)
-    size_per_element = 0.15
-    min_size = 12
-    # Get the approximate number of nodes and edges
-    num_rows = len(graph.body)
-    content_size = num_rows * size_per_element
-    size = max(min_size, content_size)
-    size_str = str(size) + "," + str(size)
-    graph.graph_attr.update(size=size_str)
-    graph.render(filename='net_graph.jpg')
-def _draw_graph(var, graph, watch=[], seen=[], indent="", pobj=None):
-    ''' recursive function going through the hierarchical graph printing off
-    what we need to see what autograd is doing.'''
-    from rich import print
-    if hasattr(var, "next_functions"):
-        for fun in var.next_functions:
-            joy = fun[0]
-            if joy is not None:
-                if joy not in seen:
-                    label = str(type(joy)).replace(
-                        "class", "").replace("'", "").replace(" ", "")
-                    label_graph = label
-                    colour_graph = ""
-                    seen.append(joy)
-                    if hasattr(joy, 'variable'):
-                        happy = joy.variable
-                        if happy.is_leaf:
-                            label += " \U0001F343"
-                            colour_graph = "green"
-                            for (name, obj) in watch:
-                                if obj is happy:
-                                    label += " \U000023E9 " + \
-                                        "[b][u][color=#FF00FF]" + name + \
-                                        "[/color][/u][/b]"
-                                    label_graph += name
-                                    colour_graph = "blue"
-                                    break
-                                vv = [str(obj.shape[x])
-                                    for x in range(len(obj.shape))]
-                                label += " [["
-                                label += ', '.join(vv)
-                                label += "]]"
-                            label += " " + str(happy.var())
-                    graph.node(str(joy), label_graph, fillcolor=colour_graph)
-                    print(indent + label)
-                    _draw_graph(joy, graph, watch, seen, indent + ".", joy)
-                    if pobj is not None:
-                        graph.edge(str(pobj), str(joy))
-
 # DATA = 'toy'
 # DATA = 'movielens'
 # DATA = 'movie100k'
 DATA = 'movie100k'
+# DATA = 'movie1M'
+# DATA = 'movie10M'
 if DATA == 'movie100':
     N_EPOCHS = 100
     DISPLAY_EPOCH_EVERY = 5
@@ -130,11 +72,12 @@ else:
         X = torch.LongTensor(df[['user', 'item']].to_numpy())
         y = torch.Tensor(df['rating'])
     elif DATA.startswith('movie100k'):
-        N_EPOCHS = 500
+        N_EPOCHS = 50
         DISPLAY_EPOCH_EVERY = 1
         BATCH_SIZE = 800
         BATCH_SIZE = 8000
         # BATCH_SIZE = 100000
+        N_GROUPS = 2
         '''df = pd.read_csv('data/movie100k/data.csv')#.head(1000)
                                 if DATA.endswith('batch'):
                                     N_EPOCHS = 100
@@ -144,6 +87,32 @@ else:
         # df = df.merge(films, on='movieId')
 
         N, M, X_train, X_test, y_train, y_test, _ = load_data('movie100k')
+        nb_samples_train = len(X_train)
+        X_train = torch.LongTensor(X_train)
+        y_train = torch.Tensor(y_train)
+        X_test = torch.LongTensor(X_test)
+        y_test = torch.Tensor(y_test)
+    elif DATA.startswith('movie1M'):
+        N_EPOCHS = 200
+        DISPLAY_EPOCH_EVERY = 1
+        BATCH_SIZE = 800
+        BATCH_SIZE = 80000
+        # BATCH_SIZE = 100000
+
+        N, M, X_train, X_test, y_train, y_test, _ = load_data('movie1M')
+        nb_samples_train = len(X_train)
+        X_train = torch.LongTensor(X_train)
+        y_train = torch.Tensor(y_train)
+        X_test = torch.LongTensor(X_test)
+        y_test = torch.Tensor(y_test)
+    elif DATA.startswith('movie10M'):
+        N_EPOCHS = 10
+        DISPLAY_EPOCH_EVERY = 1
+        BATCH_SIZE = 800
+        BATCH_SIZE = 800000
+        # BATCH_SIZE = 100000
+
+        N, M, X_train, X_test, y_train, y_test, _ = load_data('movie10M')
         nb_samples_train = len(X_train)
         X_train = torch.LongTensor(X_train)
         y_train = torch.Tensor(y_train)
@@ -191,119 +160,134 @@ class CF(nn.Module):
     """
     Recommender system
     """
-    def __init__(self, embedding_size=2, n_var_samples=1, alpha_0=300,
-            output='reg'):
+    def __init__(self, embedding_size=2, n_groups=2, group_sizes=None,
+            n_var_samples=1, alpha_0=300, output='reg'):
         super().__init__()
         self.output = output
         self.alpha = nn.Parameter(torch.Tensor([alpha_0]))
         self.drawn = False
         self.n_var_samples = n_var_samples
         self.embedding_size = embedding_size
+        self.n_groups = n_groups
+        self.group_sizes = [N, M] if group_sizes is None else group_sizes
+        assert n_groups == len(self.group_sizes)
+        self.link = torch.abs
 
-        start_scale = 0.02 ** .5
+        start_scale = 0.2
         var_prior_mean = True
 
         # Global Bias
-        self.mean_global_bias_prior  = nn.Parameter(torch.Tensor([0.]), requires_grad=var_prior_mean)
+        self.mean_global_bias_prior  = nn.Parameter(
+            torch.Tensor([0.]),
+            requires_grad=var_prior_mean
+        )
         self.scale_global_bias_prior = nn.Parameter(torch.Tensor([1.]))
 
-        self.mean_global_bias  = nn.Parameter(torch.normal(torch.zeros(1), torch.ones(1)))
+        self.mean_global_bias  = nn.Parameter(
+            torch.normal(torch.zeros(1), torch.ones(1))
+        )
         self.scale_global_bias = nn.Parameter(torch.Tensor([start_scale]))
 
         # Entity W params
-        self.mean_user_bias_prior  = nn.Parameter(torch.Tensor([0.]), requires_grad=var_prior_mean)
-        self.scale_user_bias_prior = nn.Parameter(torch.Tensor([1.]))
-        self.mean_item_bias_prior  = nn.Parameter(torch.Tensor([0.]), requires_grad=var_prior_mean)
-        self.scale_item_bias_prior = nn.Parameter(torch.Tensor([1.]))
+        self.mean_group_bias_prior  = nn.ParameterList([
+            nn.Parameter(torch.zeros(1), requires_grad=var_prior_mean)
+            for _ in range(n_groups)
+        ])
+        self.scale_group_bias_prior = nn.ParameterList([
+            nn.Parameter(torch.ones(1))
+            for _ in range(n_groups)
+        ])
 
-        # TODO: Initialize to 0, 1
         # self.bias_params = nn.Embedding(N + M, 2)  # w
-        self.bias_params = nn.Parameter(torch.cat((
-            torch.normal(torch.zeros(N + M, 1), torch.ones(N + M, 1)),
-            start_scale * torch.ones(N + M, 1)
-        ), axis=1))
+        self.bias_params = nn.Parameter(torch.cat([
+            torch.cat((
+                torch.normal(torch.zeros(ni, 1), 1e-1 * torch.ones(ni, 1)),
+                start_scale * torch.ones(ni, 1)
+            ), axis=1)
+            for ni in self.group_sizes
+        ]))
 
         # Entity V params
-        self.mean_user_entity_prior  = nn.Parameter(torch.zeros(embedding_size), requires_grad=False)
-        self.scale_user_entity_prior = nn.Parameter(torch.ones(embedding_size))
-        self.mean_item_entity_prior  = nn.Parameter(torch.zeros(embedding_size), requires_grad=False)
-        self.scale_item_entity_prior = nn.Parameter(torch.ones(embedding_size))
+        self.mean_group_entity_prior  = nn.ParameterList([
+            nn.Parameter(
+                torch.zeros(embedding_size),
+                requires_grad=var_prior_mean
+            )
+            for _ in range(n_groups)
+        ])
+        self.scale_group_entity_prior = nn.ParameterList([
+            nn.Parameter(torch.ones(embedding_size))
+            for _ in range(n_groups)
+        ])
 
-        # TODO: Initialize to 0, 1
         # self.entity_params = nn.Embedding(N + M, 2 * embedding_size)  # V
-        self.entity_params = nn.Parameter(torch.cat((
-            torch.normal(torch.zeros(N + M, embedding_size), torch.ones(N + M, embedding_size)),
-            start_scale * torch.ones(N + M, embedding_size)
-        ), axis=1))
+        self.entity_params = nn.Parameter(torch.cat([
+            torch.cat((
+                torch.normal(
+                    torch.zeros(ni, embedding_size),
+                    1e-7 * torch.ones(ni, embedding_size)
+                ),
+                start_scale * torch.ones(ni, embedding_size)
+            ), axis=1)
+            for ni in self.group_sizes
+        ]))
 
     def update_priors(self, indices):
-        n_users, n_items = map(len, indices)
+        group_sizes = list(map(len, indices))
 
         self.global_bias_prior = distributions.normal.Normal(
-            # torch.Tensor([0.]).to(device),
             self.mean_global_bias_prior,
-            # torch.nn.functional.softplus(self.scale_global_bias_prior)
-            torch.abs(self.scale_global_bias_prior)
+            self.link(self.scale_global_bias_prior)
         )
 
         self.bias_prior = distributions.normal.Normal(
-            # torch.zeros(n_users + n_items).to(device),
-            torch.cat((
-                self.mean_user_bias_prior.repeat(n_users),
-                self.mean_item_bias_prior.repeat(n_items)
-            )),
-            # torch.nn.functional.softplus(torch.cat((
-            #     self.scale_user_bias_prior.repeat(n_users),
-            #     self.scale_item_bias_prior.repeat(n_items)
-            # )))
-            torch.abs(torch.cat((
-                self.scale_user_bias_prior.repeat(n_users),
-                self.scale_item_bias_prior.repeat(n_items)
-            )))
+            torch.cat([
+                self.mean_group_bias_prior[i_group].repeat(group_sizes[i_group])
+                for i_group in range(self.n_groups)
+            ]),
+            self.link(torch.cat([
+                self.scale_group_bias_prior[i_group].repeat(group_sizes[i_group])
+                for i_group in range(self.n_groups)
+            ]))
         )
 
         self.entity_prior = distributions.normal.Normal(
-            # torch.zeros((n_users + n_items, self.embedding_size), device=device),
-            torch.cat((
-                self.mean_user_entity_prior.repeat(n_users, 1),
-                self.mean_item_entity_prior.repeat(n_items, 1)
-            )),
-            # torch.nn.functional.softplus(torch.cat((
-            #     self.scale_user_entity_prior.repeat(n_users, 1),
-            #     self.scale_item_entity_prior.repeat(n_items, 1)
-            # )))
-            torch.abs(torch.cat((
-                self.scale_user_entity_prior.repeat(n_users, 1),
-                self.scale_item_entity_prior.repeat(n_items, 1)
-            )))
+            torch.cat([
+                self.mean_group_entity_prior[i_group].repeat(group_sizes[i_group], 1)
+                for i_group in range(self.n_groups)
+            ]),
+            self.link(torch.cat([
+                self.scale_group_entity_prior[i_group].repeat(group_sizes[i_group], 1)
+                for i_group in range(self.n_groups)
+            ]))
         )
 
     def draw(self, indices):
         if self.drawn:
             return
+
         # Global bias
         self.global_bias_sampler = distributions.normal.Normal(
             self.mean_global_bias,
-            # nn.functional.softplus(self.scale_global_bias)
-            torch.abs(self.scale_global_bias)
+            self.link(self.scale_global_bias)
         )
 
         # Biases and entities
         bias_params = self.bias_params[torch.cat(indices)]
         self.bias_sampler = distributions.normal.Normal(
             bias_params[:, 0],
-            # nn.functional.softplus(bias_params[:, 1])
-            torch.abs(bias_params[:, 1])
+            self.link(bias_params[:, 1])
         )
 
         entity_params = self.entity_params[torch.cat(indices)]
         self.entity_sampler = distributions.normal.Normal(
             entity_params[:, :self.embedding_size],
-            # nn.functional.softplus(entity_params[:, self.embedding_size:]),
-            torch.abs(entity_params[:, self.embedding_size:]) + eps
+            self.link(entity_params[:, self.embedding_size:])
         )
 
-        # self.global_bias = self.global_bias_sampler.rsample((self.n_var_samples,)).squeeze(dim=1)
+        # self.global_bias = self.global_bias_sampler \
+        #                        .rsample((self.n_var_samples,)) \
+        #                        .squeeze(dim=1)
         # self.all_bias = self.bias_sampler.rsample((self.n_var_samples,))
         # self.all_entity = self.entity_sampler.rsample((self.n_var_samples,))
 
@@ -313,23 +297,27 @@ class CF(nn.Module):
         self.update_priors(x_unique)
         self.draw(x_unique)
 
+        batch_entities = [
+            x[i] + sum(map(len, x_unique[:i]))
+            for i in range(len(x))
+        ]
         biases   = torch.cat([
             torch.index_select(self.bias_sampler.mean, 0, x_entities)
                  .reshape((-1, 1))
-            for x_entities in [x[0], x[1] + len(x_unique[0])]
+            for x_entities in batch_entities
         ], axis=1)
         entities = torch.cat([
             torch.index_select(self.entity_sampler.mean, 0, x_entities)
                  .reshape((-1, 1, self.embedding_size))
-            for x_entities in [x[0], x[1] + len(x_unique[0])]
+            for x_entities in batch_entities
         ], axis=1)
 
-        sum_users_items_biases = biases.sum(axis=1)
-        users_items_emb = entities.prod(axis=1).sum(axis=1)
+        sum_groups_biases = biases.sum(axis=1)
+        groups_emb = entities.prod(axis=1).sum(axis=1)
         unscaled_pred = (
               self.global_bias_sampler.mean
-            + sum_users_items_biases
-            + users_items_emb
+            + sum_groups_biases
+            + groups_emb
         )
         # sum_users_items_biases = biases.sum(axis=2)
         # users_items_emb = entities.prod(axis=2).sum(axis=2)
@@ -340,7 +328,7 @@ class CF(nn.Module):
         # )
 
         if self.output == 'reg':
-            std_dev = torch.sqrt(1 / nn.functional.softplus(self.alpha))
+            std_dev = torch.sqrt(1 / self.link(self.alpha))
             likelihood = distributions.normal.Normal(unscaled_pred, std_dev)
         else:
             likelihood = distributions.bernoulli.Bernoulli(logits=unscaled_pred)
@@ -356,56 +344,80 @@ class CF(nn.Module):
                 # mu_0'
                 + self.mean_global_bias
                 # sum_i mu_w_i' x_n_i
-                + self.bias_params[x_unique[0][x[0]], 0]
-                + self.bias_params[x_unique[1][x[1]], 0]
+                + sum([
+                    self.bias_params[x_unique[i_group][x[i_group]], 0]
+                    for i_group in range(self.n_groups)
+                ])
                 # sum_i sum_j x_n_i x_n_j + sum_k mu_v_i,k' mu_v_j,k'
-                + torch.einsum(
-                    'ab,ab->a',
-                    self.entity_params[x_unique[0][x[0]], :self.embedding_size],
-                    self.entity_params[x_unique[1][x[1]], :self.embedding_size]
-                )
+                + sum([
+                    torch.einsum(
+                        'ab,ab->a',
+                        self.entity_params[
+                            x_unique[i_group][x[i_group]],
+                            :self.embedding_size
+                        ],
+                        self.entity_params[
+                            x_unique[j_group][x[j_group]],
+                            :self.embedding_size
+                        ]
+                    )
+                    for i_group in range(self.n_groups)
+                    for j_group in range(i_group+1, self.n_groups)
+                ])
             )
             T_n = (
                 # sigma_0^2'
                 + self.scale_global_bias ** 2
                 # sum_i sigma_w_i' x_n_i^2
-                + (
-                    self.bias_params[x_unique[0][x[0]], 1]
-                )**2
-                + (
-                    self.bias_params[x_unique[1][x[1]], 1]
-                )**2
+                + sum([
+                    self.bias_params[x_unique[i_group][x[i_group]], 1] ** 2
+                    for i_group in range(self.n_groups)
+                ])
                 # sum_i sum_j x_n_i^2 x_n_j^2
                 # + sum_k mu_v_i,k'^2 sigma_v_j,k'
-                + torch.einsum(
-                    'ab,ab->a',
-                    self.entity_params[x_unique[0][x[0]], :self.embedding_size]**2,
-                    (
-                        self.entity_params[x_unique[1][x[1]], self.embedding_size:]
-                    ) ** 2
-                )
-                # +       mu_v_j,k'^2 sigma_v_i,k'
-                + torch.einsum(
-                    'ab,ab->a',
-                    self.entity_params[x_unique[1][x[1]], :self.embedding_size]**2,
-                    (
-                        self.entity_params[x_unique[0][x[0]], self.embedding_size:]
-                    ) ** 2
-                )
-                # +       sigma_v_i,k' sigma_v_j,k'
-                + torch.einsum(
-                    'ab,ab->a',
-                    (
-                        self.entity_params[x_unique[0][x[0]], self.embedding_size:]
-                    ) ** 2,
-                    (
-                        self.entity_params[x_unique[1][x[1]], self.embedding_size:]
-                    ) ** 2
-                )
+                + sum([
+                    + torch.einsum(
+                        'ab,ab->a',
+                        self.entity_params[
+                            x_unique[i_group][x[i_group]],
+                            :self.embedding_size
+                        ] ** 2,
+                        self.entity_params[
+                            x_unique[j_group][x[j_group]],
+                            self.embedding_size:
+                        ] ** 2
+                    )
+                    # +       mu_v_j,k'^2 sigma_v_i,k'
+                    + torch.einsum(
+                        'ab,ab->a',
+                        self.entity_params[
+                            x_unique[j_group][x[j_group]],
+                            :self.embedding_size
+                        ] ** 2,
+                        self.entity_params[
+                            x_unique[i_group][x[i_group]],
+                            self.embedding_size:
+                        ] ** 2
+                    )
+                    # +       sigma_v_i,k' sigma_v_j,k'
+                    + torch.einsum(
+                        'ab,ab->a',
+                        self.entity_params[
+                            x_unique[i_group][x[i_group]],
+                            self.embedding_size:
+                        ] ** 2,
+                        self.entity_params[
+                            x_unique[j_group][x[j_group]],
+                            self.embedding_size:
+                        ] ** 2
+                    )
+                    for i_group in range(self.n_groups)
+                    for j_group in range(i_group + 1, self.n_groups)
+                ])
             )
             partial_loss = (
-                + 1/2 * nn.functional.softplus(self.alpha).log()
-                - nn.functional.softplus(self.alpha) / 2
+                + 1/2 * self.link(self.alpha).log()
+                - self.link(self.alpha) / 2
                     * ((target - y_n_bar)**2 + T_n)
             ).sum()
 
@@ -422,9 +434,12 @@ default_progress = {
     'all_rmse': float('nan')
 }
 
-def run(lr=0.02, alpha_0=300, embedding_size=2, n_var_samples=1):
+def run(lr=0.02, alpha_0=300, embedding_size=2, n_groups=2, group_sizes=None,
+        n_var_samples=1):
     model = CF(
         embedding_size=embedding_size,
+        n_groups=n_groups,
+        group_sizes=group_sizes,
         n_var_samples=n_var_samples,
         alpha_0=alpha_0,
         output=OUTPUT_TYPE
@@ -436,10 +451,10 @@ def run(lr=0.02, alpha_0=300, embedding_size=2, n_var_samples=1):
     y_pred_all = np.zeros(len(test_dataset))
     rmses = {'all': [], 'this': [], 'train': []}
     params = {
-        'mmin': [],
-        'mmax': [],
-        'vmin': [],
-        'vmax': [],
+        'mmin': [[] for _ in range(n_groups)],
+        'mmax': [[] for _ in range(n_groups)],
+        'vmin': [[] for _ in range(n_groups)],
+        'vmax': [[] for _ in range(n_groups)],
     }
 
     if LBFGS:
@@ -478,12 +493,13 @@ def run(lr=0.02, alpha_0=300, embedding_size=2, n_var_samples=1):
         pred = []
         truth = []
 
-        print(model.entity_params[:,:embedding_size].min(), model.entity_params[:,:embedding_size].max())
-        print(torch.abs(model.entity_params[:,embedding_size:]).min(), torch.abs(model.entity_params[:,embedding_size:]).max())
-        params['mmin'].append(model.entity_params[:,:embedding_size].min().cpu().detach().numpy())
-        params['mmax'].append(model.entity_params[:,:embedding_size].max().cpu().detach().numpy())
-        params['vmin'].append(torch.abs(model.entity_params[:,embedding_size:]).min().cpu().detach().numpy())
-        params['vmax'].append(torch.abs(model.entity_params[:,embedding_size:]).max().cpu().detach().numpy())
+        for i_group in range(n_groups):
+            print(model.entity_params[i_group][:embedding_size].min(), model.entity_params[i_group][:embedding_size].max())
+            print(torch.abs(model.entity_params[i_group][embedding_size:]).min(), torch.abs(model.entity_params[i_group][embedding_size:]).max())
+            params['mmin'][i_group].append(model.entity_params[i_group][:embedding_size].min().cpu().detach().numpy())
+            params['mmax'][i_group].append(model.entity_params[i_group][:embedding_size].max().cpu().detach().numpy())
+            params['vmin'][i_group].append(torch.abs(model.entity_params[i_group][embedding_size:]).min().cpu().detach().numpy())
+            params['vmax'][i_group].append(torch.abs(model.entity_params[i_group][embedding_size:]).max().cpu().detach().numpy())
 
         progress.reset(batch_task)
         for indices, target in train_iter:
@@ -640,17 +656,18 @@ def run(lr=0.02, alpha_0=300, embedding_size=2, n_var_samples=1):
         print(model.alpha)
 
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 18))
-    ax1.set_ylim([0.8, 1.4])
+    ax1.set_ylim([0.7, 1.4])
     ax1.plot(rmses['train'], label='VFM train')
     ax1.plot(rmses['this'], label='VFM this')
     ax1.plot(rmses['all'], label='VFM all')
     ax1.legend()
     ax2.plot(elbos, label='elbo')
     ax2.legend()
-    ax3.plot(params['mmin'], label='mean min')
-    ax3.plot(params['mmax'], label='mean max')
-    ax3.plot(params['vmin'], label='var min')
-    ax3.plot(params['vmax'], label='var max')
+    for i_group in range(n_groups):
+        ax3.plot(params['mmin'][i_group], label=f'{i_group} mean min')
+        ax3.plot(params['mmax'][i_group], label=f'{i_group} mean max')
+        ax3.plot(params['vmin'][i_group], label=f'{i_group} var min')
+        ax3.plot(params['vmax'][i_group], label=f'{i_group} var max')
     ax3.legend()
     fig.savefig(f'VFMrmses_{all_rmse:.4f}.png')
 
@@ -705,6 +722,7 @@ with Progress(
     )
 
     print(run(lr=LEARNING_RATE, alpha_0=alpha_0, embedding_size=EMBEDDING_SIZE,
+              n_groups=N_GROUPS, group_sizes=[N, M],
               n_var_samples=N_VARIATIONAL_SAMPLES))
 
     # task = progress.add_task(description='Grid Search', total=search_size**2, **default_progress)
@@ -718,7 +736,7 @@ with Progress(
     #     # for a0 in 10 ** np.linspace(-0.3, 0.3, search_size):
     #     progress.update(task, elbo=best_es, all_rmse=best_rmse)
     #     loss = run(lr=LEARNING_RATE, alpha_0=alpha_0,
-    #         embedding_size=es,
+    #         embedding_size=es, n_groups=N_GROUPS, group_sizes=[N, M],
     #         n_var_samples=N_VARIATIONAL_SAMPLES)
     #     if loss < best_rmse:
     #         best_rmse = loss
