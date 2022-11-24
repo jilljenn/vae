@@ -4,8 +4,8 @@ import json
 import re
 import matplotlib.pyplot as plt
 import numpy as np
-params = {'text.usetex': True, 'font.family': 'serif'}
-plt.rcParams.update(params)
+# params = {'text.usetex': True, 'font.family': 'serif'}
+# plt.rcParams.update(params)
 default_cycler = list(plt.rcParams['axes.prop_cycle'])
 import os
 
