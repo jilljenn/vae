@@ -8,6 +8,12 @@ import logging
 
 
 def load_data(DATA, output_type='reg'):
+    if DATA == 'fr_en':
+        columns = ['format', 'shifted_item', 'user']
+        outcome_column = 'outcome'
+    else:
+        columns = ['user', 'shifted_item']
+        outcome_column = 'rating' if output_type == 'reg' else 'outcome'
     i = {}
     DATA_PATH = Path('data') / DATA
     df = pd.read_csv(DATA_PATH / 'data.csv')
@@ -15,12 +21,11 @@ def load_data(DATA, output_type='reg'):
         df['shifted_item'] = df['item']
     i['trainval'] = pd.read_csv(DATA_PATH / 'trainval.csv')['index'].tolist()
     i['test'] = pd.read_csv(DATA_PATH / 'test.csv')['index'].tolist()
-    outcome_column = 'rating' if output_type == 'reg' else 'outcome'
-    df_trainval = df.loc[i['trainval'], ['user', 'shifted_item', outcome_column]]
-    df_test = df.loc[i['test'], ['user', 'shifted_item', outcome_column]]
-    X_train = df_trainval[['user', 'shifted_item']].to_numpy()
+    df_trainval = df.loc[i['trainval'], [outcome_column] + columns]
+    df_test = df.loc[i['test'], [outcome_column] + columns]
+    X_train = df_trainval[columns].to_numpy()
     y_train = df_trainval[outcome_column].to_numpy()
-    X_test = df_test[['user', 'shifted_item']].to_numpy()
+    X_test = df_test[columns].to_numpy()
     y_test = df_test[outcome_column].to_numpy()
 
     '''for dataset in ['trainval', 'test']:

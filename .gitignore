@@ -6,3 +6,4 @@ venv2
 *.pyc
 *.txt
 *.png
+*.json

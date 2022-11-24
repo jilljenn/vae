@@ -30,6 +30,9 @@ device = torch.device('cpu')  # cuda
 DATA = 'movie100k'
 # DATA = 'movie1M'
 # DATA = 'movie10M'
+# DATA = 'fr_en'
+GROUP_SIZES = None
+BOUNDS = (1, 5)
 if DATA == 'movie100':
     N_EPOCHS = 100
     DISPLAY_EPOCH_EVERY = 5
@@ -74,7 +77,7 @@ else:
         X = torch.LongTensor(df[['user', 'item']].to_numpy())
         y = torch.Tensor(df['rating'])
     elif DATA.startswith('movie100k'):
-        N_EPOCHS = 10
+        N_EPOCHS = 200
         DISPLAY_EPOCH_EVERY = 1
         BATCH_SIZE = 800
         BATCH_SIZE = 8000
@@ -138,6 +141,29 @@ else:
         df['item'] += N # - 1
         X = torch.LongTensor(df[['user', 'item']].to_numpy())
         y = torch.LongTensor(df['outcome'])
+    elif DATA.startswith('fr_en'):
+        N_EPOCHS = 50
+        DISPLAY_EPOCH_EVERY = 1
+        BATCH_SIZE = 800
+        BATCH_SIZE = 80000
+        # BATCH_SIZE = 100000
+        N_GROUPS = 3
+        '''df = pd.read_csv('data/movie100k/data.csv')#.head(1000)
+                                if DATA.endswith('batch'):
+                                    N_EPOCHS = 100
+                                    DISPLAY_EPOCH_EVERY = 10
+                                    df = df.head(1000)'''
+        # films = pd.read_csv('ml-latest-small/movies.csv')
+        # df = df.merge(films, on='movieId')
+
+        N, M, X_train, X_test, y_train, y_test, _ = load_data('fr_en')
+        GROUP_SIZES = [3, M, N]
+        BOUNDS = (0, 1)
+        nb_samples_train = len(X_train)
+        X_train = torch.LongTensor(X_train)
+        y_train = torch.Tensor(y_train)
+        X_test = torch.LongTensor(X_test)
+        y_test = torch.Tensor(y_test)
 
     if X_train is None:
         X_train, X_test, y_train, y_test = train_test_split(
@@ -438,6 +464,8 @@ default_progress = {
 def run(lr=0.02, alpha_0=300, embedding_size=2, n_groups=2, group_sizes=None,
         n_var_samples=1):
     run_name = f'{DATA}_lr_{lr}_a0_{alpha_0}_embedding_size_{embedding_size}_n_groups_{n_groups}_n_var_samples_{n_var_samples}_{datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}'
+    if group_sizes is None:
+        group_sizes = [N, M]
     model = CF(
         embedding_size=embedding_size,
         n_groups=n_groups,
@@ -505,43 +533,59 @@ def run(lr=0.02, alpha_0=300, embedding_size=2, n_groups=2, group_sizes=None,
 
         progress.reset(batch_task)
         for indices, target in train_iter:
-            user_present, inverse_user, batch_user_count = torch.unique(
-                    indices[:,0],
-                return_inverse=True,
-                return_counts=True
-            )
-            item_present, inverse_item, batch_item_count = torch.unique(
-                    indices[:,1],
-                return_inverse=True,
-                return_counts=True
-            )
+            group_present, inverse_group, batch_group_count = [], [], []
+            for i_group in range(n_groups):
+                present, inverse, batch_count = torch.unique(
+                        indices[:,i_group],
+                    return_inverse=True,
+                    return_counts=True
+                )
+                group_present.append(present)
+                inverse_group.append(inverse)
+                batch_group_count.append(batch_count)
 
             if not LBFGS:
                 outputs, kls, partial_loss = model(
-                    (inverse_user, inverse_item),
-                    (user_present, item_present),
+                    inverse_group,
+                    group_present,
                     closed_form_loss=True,
                     target=target
                 )
 
-                y_pred = outputs.mean.detach().cpu().numpy().clip(1, 5)
+                y_pred = outputs.mean.detach().cpu().numpy().clip(*BOUNDS)
 
-                loss = (
-                    # - outputs.log_prob(target.float()).sum()
-                    - partial_loss
-                    + kls[0] / len(train_iter)
-                    + (
-                        (kls[1] + kls[2].sum(axis=1))
-                        * torch.concat((
-                            batch_user_count,
-                            batch_item_count
-                        ))
-                        / entity_count[torch.concat((
-                            user_present,
-                            item_present
-                        ))]
-                    ).sum()
-                )
+                if False:
+                    loss = (
+                        # - outputs.log_prob(target.float()).sum()
+                        - partial_loss
+                        + kls[0] / len(train_iter)
+                        + (
+                            (kls[1] + kls[2].sum(axis=1))
+                            * torch.concat(batch_group_count)
+                            / entity_count[torch.concat(group_present)]
+                        ).sum()
+                    )
+                else:
+                    loss = (
+                        # - outputs.log_prob(target.float()).sum()
+                        - len(X_train) * partial_loss / len(indices)
+                        + kls[0]
+                        + (
+                            (kls[1] + kls[2].sum(axis=1))
+                            * torch.cat([
+                                torch.Tensor(
+                                      group_sizes[i_group]
+                                    / (
+                                          batch_group_count[i_group]
+                                        / entity_count[group_present[i_group]]
+                                    ).sum()
+                                ).repeat(len(group_present[i_group]))
+                                for i_group in range(n_groups)
+                            ])
+                            * torch.concat(batch_group_count)
+                            / entity_count[torch.concat(group_present)]
+                        ).sum()
+                    )
 
                 losses.append(loss.item())
 
@@ -583,7 +627,7 @@ def run(lr=0.02, alpha_0=300, embedding_size=2, n_groups=2, group_sizes=None,
                     (inverse_user, inverse_item),
                     (user_present, item_present),
                 )
-                y_pred = outputs.mean.detach().cpu().numpy().clip(1, 5)
+                y_pred = outputs.mean.detach().cpu().numpy().clip(*BOUNDS)
 
             # print(y_pred.shape)
             pred.extend(y_pred)
@@ -617,21 +661,21 @@ def run(lr=0.02, alpha_0=300, embedding_size=2, n_groups=2, group_sizes=None,
             # print('bias max abs', model.bias_params.weight.abs().max())
             # print('entity max abs', model.entity_params.weight.abs().max())
 
-            user_present, inverse_user, batch_user_count = torch.unique(
-                    X_test[:,0],
-                return_inverse=True,
-                return_counts=True
-            )
-            item_present, inverse_item, batch_item_count = torch.unique(
-                    X_test[:,1],
-                return_inverse=True,
-                return_counts=True
-            )
+            group_present, inverse_group, batch_group_count = [], [], []
+            for i_group in range(n_groups):
+                present, inverse, batch_count = torch.unique(
+                        X_test[:,i_group],
+                    return_inverse=True,
+                    return_counts=True
+                )
+                group_present.append(present)
+                inverse_group.append(inverse)
+                batch_group_count.append(batch_count)
             outputs, _ = model(
-                (inverse_user, inverse_item),
-                (user_present, item_present)
+                inverse_group,
+                group_present
             )
-            y_pred = outputs.mean.detach().cpu().numpy().clip(1, 5)
+            y_pred = outputs.mean.detach().cpu().numpy().clip(*BOUNDS)
             y_preds.append(y_pred)
             nb_all = 1
             if epoch >= 1000:
@@ -658,7 +702,8 @@ def run(lr=0.02, alpha_0=300, embedding_size=2, n_groups=2, group_sizes=None,
         print(model.alpha)
 
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(8, 18))
-    ax1.set_ylim([0.7, 1.4])
+    if DATA != 'fr_en':
+        ax1.set_ylim([0.7, 1.4])
     ax1.plot(rmses['train'], label='VFM train')
     ax1.plot(rmses['this'], label='VFM this')
     ax1.plot(rmses['all'], label='VFM all')
@@ -693,7 +738,8 @@ def run(lr=0.02, alpha_0=300, embedding_size=2, n_groups=2, group_sizes=None,
 OUTPUT_TYPE = 'reg'
 LBFGS = False
 
-LEARNING_RATE = 1. / len(train_iter)
+# LEARNING_RATE = 1. / len(train_iter)
+LEARNING_RATE = 0.1
 alpha_0 = 0.5 * len(train_iter)
 EMBEDDING_SIZE = 5
 N_VARIATIONAL_SAMPLES = 1
@@ -727,7 +773,7 @@ with Progress(
     )
 
     print(run(lr=LEARNING_RATE, alpha_0=alpha_0, embedding_size=EMBEDDING_SIZE,
-              n_groups=N_GROUPS, group_sizes=[N, M],
+              n_groups=N_GROUPS, group_sizes=GROUP_SIZES,
               n_var_samples=N_VARIATIONAL_SAMPLES))
 
     # task = progress.add_task(description='Grid Search', total=search_size**2, **default_progress)
