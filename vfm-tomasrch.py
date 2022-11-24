@@ -4,6 +4,8 @@ JJV for Deep Learning course, 2022
 """
 import numpy as np
 
+import datetime
+import json
 import torch
 from torch import nn, distributions
 from torch.utils.tensorboard import SummaryWriter
@@ -25,8 +27,8 @@ device = torch.device('cpu')  # cuda
 # DATA = 'toy'
 # DATA = 'movielens'
 # DATA = 'movie100k'
-# DATA = 'movie100k'
-DATA = 'movie1M'
+DATA = 'movie100k'
+# DATA = 'movie1M'
 # DATA = 'movie10M'
 if DATA == 'movie100':
     N_EPOCHS = 100
@@ -72,7 +74,7 @@ else:
         X = torch.LongTensor(df[['user', 'item']].to_numpy())
         y = torch.Tensor(df['rating'])
     elif DATA.startswith('movie100k'):
-        N_EPOCHS = 200
+        N_EPOCHS = 10
         DISPLAY_EPOCH_EVERY = 1
         BATCH_SIZE = 800
         BATCH_SIZE = 8000
@@ -435,6 +437,7 @@ default_progress = {
 
 def run(lr=0.02, alpha_0=300, embedding_size=2, n_groups=2, group_sizes=None,
         n_var_samples=1):
+    run_name = f'{DATA}_lr_{lr}_a0_{alpha_0}_embedding_size_{embedding_size}_n_groups_{n_groups}_n_var_samples_{n_var_samples}_{datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")}'
     model = CF(
         embedding_size=embedding_size,
         n_groups=n_groups,
@@ -668,7 +671,10 @@ def run(lr=0.02, alpha_0=300, embedding_size=2, n_groups=2, group_sizes=None,
         ax3.plot(params['vmin'][i_group], label=f'{i_group} var min')
         ax3.plot(params['vmax'][i_group], label=f'{i_group} var max')
     ax3.legend()
-    fig.savefig(f'VFMrmses_{all_rmse:.4f}.png')
+    fig.savefig(f'RMSE_{run_name}.png')
+
+    with open(f"RMSE_{run_name}.json", "w") as outfile:
+        json.dump(rmses, outfile, indent=4)
 
     return test_rmse
 
