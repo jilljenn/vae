@@ -25,8 +25,8 @@ device = torch.device('cpu')  # cuda
 # DATA = 'toy'
 # DATA = 'movielens'
 # DATA = 'movie100k'
-DATA = 'movie100k'
-# DATA = 'movie1M'
+# DATA = 'movie100k'
+DATA = 'movie1M'
 # DATA = 'movie10M'
 if DATA == 'movie100':
     N_EPOCHS = 100
@@ -72,7 +72,7 @@ else:
         X = torch.LongTensor(df[['user', 'item']].to_numpy())
         y = torch.Tensor(df['rating'])
     elif DATA.startswith('movie100k'):
-        N_EPOCHS = 50
+        N_EPOCHS = 200
         DISPLAY_EPOCH_EVERY = 1
         BATCH_SIZE = 800
         BATCH_SIZE = 8000
@@ -95,9 +95,8 @@ else:
     elif DATA.startswith('movie1M'):
         N_EPOCHS = 200
         DISPLAY_EPOCH_EVERY = 1
-        BATCH_SIZE = 800
-        BATCH_SIZE = 80000
-        # BATCH_SIZE = 100000
+        BATCH_SIZE = 8000
+        N_GROUPS = 2
 
         N, M, X_train, X_test, y_train, y_test, _ = load_data('movie1M')
         nb_samples_train = len(X_train)
@@ -690,7 +689,7 @@ LBFGS = False
 
 LEARNING_RATE = 1. / len(train_iter)
 alpha_0 = 0.5 * len(train_iter)
-EMBEDDING_SIZE = 12
+EMBEDDING_SIZE = 5
 N_VARIATIONAL_SAMPLES = 1
 
 best_lr, best_a0, best_es = float('nan'), float('nan'), float('nan')
