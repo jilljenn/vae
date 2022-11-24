@@ -6,6 +6,8 @@ import numpy as np
 import json
 import sys
 import os
+# params = {'text.usetex': True, 'font.family': 'serif'}
+# plt.rcParams.update(params)
 default_cycler = list(plt.rcParams['axes.prop_cycle'])
 
 
@@ -54,7 +56,7 @@ METHODS = {
 }
 
 train_epochs = np.unique(sorted(data['metrics']['train']['epoch']))
-test_epochs = data['metrics']['test']['epoch']
+test_epochs = data['metrics']['test']['epoch'][:MAX_EPOCH]
 print('Train', min(train_epochs), max(train_epochs))
 train = data['metrics']['train']['elbo']
 
@@ -96,15 +98,16 @@ if cv:
     fig, ((elbo, metric), (progress_graph, criterion_graph)) = plt.subplots(2, 2, figsize=(8, 8))
 else:
     fig, metric = plt.subplots(1, 1, figsize=(4, 4))
-    metric.set_title('Test {:s} ↓ over epochs'.format(metric_name.upper()))
+    order = '↓' if metric_name == 'rmse' else '↑'
+    metric.set_title(f'Test {metric_name.upper()} {order} over epochs')
     metric.set_xlabel('Epochs')
     metric.set_ylabel(metric_name.upper())
 
 if metric_name in data['metrics']['train']:
     metric.plot(train_epochs, data['metrics']['train'][metric_name], label='train {:s}'.format(metric_name))
-metric.plot(test_epochs, data['metrics']['test'][metric_name], **get_style_and_label('VFM last'))
+metric.plot(test_epochs, data['metrics']['test'][metric_name][:MAX_EPOCH], **get_style_and_label('VFM last'))
 if 'rmse_all_of_mean' in data['metrics']['test']:
-    metric.plot(test_epochs, data['metrics']['test']['rmse_all_of_mean'], **get_style_and_label('VFM mean'))
+    metric.plot(test_epochs, data['metrics']['test']['rmse_all_of_mean'][:MAX_EPOCH], **get_style_and_label('VFM mean'))
     print('VFM mean', data['metrics']['test']['rmse_all_of_mean'][:MAX_EPOCH][-1])
 elif 'acc_all' in data['metrics']['test']:
     metric.plot(test_epochs, data['metrics']['test']['acc_all'], **get_style_and_label('VFM mean'))
@@ -146,6 +149,8 @@ metric.legend()
 if metric_name == 'rmse':
     metric.set_ylim(ymax=1.2)
 # fig.legend()
+plt.tight_layout()
 fig.savefig('{:s}'.format(fig_name_png, format='png', bbox_inches='tight'))
-fig.savefig('{:s}'.format(fig_name, format='pdf', bbox_inches='tight'))
+fig.savefig('{:s}'.format(fig_name, format='pdf'))#, bbox_inches='tight'))
 os.system('open {:s}'.format(fig_name))
+# plt.show()

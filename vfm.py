@@ -54,7 +54,7 @@ parser.add_argument('--valid-only', type=bool, nargs='?', const=True, default=Fa
 
 parser.add_argument('--valid_patience', type=int, nargs='?', default=4)
 parser.add_argument('--train_patience', type=int, nargs='?', default=6)
-parser.add_argument('--d', type=int, nargs='?', default=3)
+parser.add_argument('--d', type=int, nargs='?', default=5)
 # parser.add_argument('--lr', type=float, nargs='?', default=0.1)
 parser.add_argument('--nb-batches', type=int, nargs='?', default=1)
 parser.add_argument('--min-epochs', type=int, nargs='?', default=0)
@@ -81,7 +81,7 @@ COMPUTE_VALID_EVERY = 1
 COMPUTE_TEST_EVERY = 1 if not options.valid_only else MAX_EPOCHS + 1
 embedding_size = options.d
 nb_iters = options.nb_batches
-learning_rate = 0.1 # 1 / nb_iters  # learning_rate 0.001 works better for classification
+learning_rate = 1.  # 1 / nb_iters  # learning_rate 0.001 works better for classification
 if options.classification:
     learning_rate = 0.1
 link = tf.nn.softplus if options.link == 'softplus' else tf.math.abs
@@ -545,11 +545,15 @@ def define_variables(train_category, priors, batch_size, var_list=None):
     pred = tf.reduce_mean(likelihood.mean(), axis=0)  # À cause du nombre de variational samples
     # pred = tf.reduce_mean(likelihood.sample(), axis=0)  # Sampling instead of mean is worse
     pred_of_mean = (
-        global_bias + mean_bias_users + mean_bias_items + mean_bias_formats +
-        tf.reduce_sum(mean_feat_users * mean_feat_items, 1) +
-        tf.reduce_sum(mean_feat_items * mean_feat_formats, 1) +
-        tf.reduce_sum(mean_feat_users * mean_feat_formats, 1)
+        global_bias + mean_bias_users + mean_bias_items +
+        tf.reduce_sum(mean_feat_users * mean_feat_items, 1)
     )
+    if options.format:
+        pred_of_mean += (
+            mean_bias_formats +
+            tf.reduce_sum(mean_feat_items * mean_feat_formats, 1) +
+            tf.reduce_sum(mean_feat_users * mean_feat_formats, 1)
+        )
     print('formats', mean_bias_users.shape, mean_feat_formats.shape)
     if is_classification:
         pred_of_mean = tf.sigmoid(pred_of_mean)
@@ -822,8 +826,8 @@ class VFM:
         self.optimized_vars = optimized_vars
         self.nb_batches = nb_batches
         self.strategy = ''
-        self.all_preds = defaultdict(list)
-        self.all_preds_of_mean = defaultdict(list)
+        self.all_preds = defaultdict(lambda: 0.)
+        self.all_preds_of_mean = defaultdict(lambda: 0.)
         self.init_train()
 
     def reset(self, strategy='random'):
@@ -940,13 +944,14 @@ class VFM:
         if len(self.metrics[category]['epoch']) == 0 or self.metrics[category]['epoch'][-1] != epoch:
             self.metrics[category]['epoch'].append(epoch)
         # print('hey', category, y_pred.shape)
-        self.all_preds[category].append(y_pred.tolist())
-        self.all_preds_of_mean[category].append(y_pred_of_mean.tolist())
+        self.all_preds[category] += y_pred
+        self.all_preds_of_mean[category] += y_pred_of_mean
         # print(self.all_preds)
         # print(np.array(self.all_preds).shape, [len(term) for term in self.all_preds[category]])
         if category != 'train':
-            mean_pred = np.array(self.all_preds[category]).mean(axis=0)
-            mean_pred_of_mean = np.array(self.all_preds_of_mean[category]).mean(axis=0)
+            # print(self.all_preds[category], self.all_preds[category].min(), self.all_preds[category].max(), len(self.metrics[category]['epoch']))
+            mean_pred = self.all_preds[category] / (len(self.metrics[category]['epoch']))
+            mean_pred_of_mean = self.all_preds_of_mean[category] / (len(self.metrics[category]['epoch']))
         self.metrics[category]['acc'].append(np.mean(y_truth == np.round(y_pred)))
         if category != 'train':
             self.metrics[category]['acc_all'].append(np.mean(y_truth == np.round(mean_pred)))
