@@ -23,27 +23,34 @@ def get_style(label):
 
 def plot_after(data, filename):
     plt.clf()
-    fig, axes = plt.subplots(1, 4, figsize=(13, 3))
+    fig, axes = plt.subplots(1, 4, figsize=(16, 4))
     pos = 0
     displayed = {
         'auc': 'Area under the ROC curve',
         'acc': 'Accuracy',
         'map': 'Mean average precision',
-        'mean test variance': 'Mean variance'
+        'mean test variance': 'Mean variance',
+        'auc_of_mean': 'AUC of mean'
     }
-    permutation = [0, 1, 2, 3]
-    for metric in sorted(set(data['metrics']['random']) - {
+    permutation = [0, 1, 2, 3, 4]
+    # print(data['metrics']['random'])
+    for metric in sorted(set(data['metrics']['mean']) - {
             'nb_train_samples', 'epoch', 'best epoch'}):
+        # print(metric)
         if 'best' in metric or 'all' in metric or 'nll' in metric:
             continue
         # print(pos, metric)
         ax_i = 0
         ax_j = permutation[pos]
         axes[ax_j].title.set_text(displayed[metric])
-        axes[ax_j].set_xlabel('Number of questions asked')
+        axes[ax_j].set_xlabel('Number of items asked')
+        axes[ax_j].set_xticks(np.arange(4, 24, 4))
         for _, strategy in enumerate(['random', 'mean', 'variance']):
             if strategy in data['metrics']:
-                x = np.array(data['metrics'][strategy]['nb_train_samples']) / 16
+                # if strategy in {'random', 'variance'}:
+                #     continue
+                # print(strategy)
+                x = np.array(data['metrics'][strategy]['nb_train_samples']) / 20
                 print(strategy, metric, ' & '.join(map(str, np.round(data['metrics'][strategy][metric], 3))))
                 axes[ax_j].plot(x, data['metrics'][strategy][metric], label=strategy, **get_style(strategy))
         plt.legend()

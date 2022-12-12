@@ -48,7 +48,7 @@ parser.add_argument('--regression', type=bool, nargs='?', const=True, default=Fa
 parser.add_argument('--classification', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--load', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--single_user', type=bool, nargs='?', const=True, default=False)
-parser.add_argument('--split_valid', type=bool, nargs='?', const=True, default=False)
+parser.add_argument('--split-valid', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--interactive', type=bool, nargs='?', const=True, default=False)
 parser.add_argument('--valid-only', type=bool, nargs='?', const=True, default=False)
 
@@ -73,8 +73,9 @@ DATA_PATH = Path('data') / DATA
 logging.warning('Data is %s', DATA)
 VERBOSE = options.v
 NB_VARIATIONAL_SAMPLES = options.var_samples
-N_QUESTIONS_ASKED = 20
-TRAIN_EVERY_N_QUESTIONS = 4
+print(NB_VARIATIONAL_SAMPLES, 'plz')
+N_QUESTIONS_ASKED = 15
+TRAIN_EVERY_N_QUESTIONS = 1
 MIN_EPOCHS = options.min_epochs
 MAX_EPOCHS = options.max_epochs
 COMPUTE_VALID_EVERY = 1
@@ -913,7 +914,7 @@ class VFM:
             rounding = 5
         if self.epoch < MIN_EPOCHS:
             return False, []
-        if self.epoch > MAX_EPOCHS:
+        if self.epoch >= MAX_EPOCHS:
             return True, []
         # If these metrics decrease, it's worse
         should_not_decrease = self.metric_watcher in {'acc', 'auc', 'elbo', 'auc_all'}
@@ -1084,8 +1085,8 @@ class VFM:
         self.metrics['train'] = defaultdict(list)  # Flush metrics
         self.metrics['test'] = defaultdict(list)
 
-        logging.warning('Test initial performance')
-        self.run_and_save('test')
+        # logging.warning('Test initial performance')
+        # self.run_and_save('test')
 
         if is_classification:
             self.predict_proba()

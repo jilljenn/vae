@@ -110,7 +110,7 @@ if 'rmse_all_of_mean' in data['metrics']['test']:
     metric.plot(test_epochs, data['metrics']['test']['rmse_all_of_mean'][:MAX_EPOCH], **get_style_and_label('VFM mean'))
     print('VFM mean', data['metrics']['test']['rmse_all_of_mean'][:MAX_EPOCH][-1])
 elif 'acc_all' in data['metrics']['test']:
-    metric.plot(test_epochs, data['metrics']['test']['acc_all'], **get_style_and_label('VFM mean'))
+    metric.plot(test_epochs, data['metrics']['test']['acc_all'][:MAX_EPOCH], **get_style_and_label('VFM mean'))
     print('VFM mean ACC', data['metrics']['test']['acc_all'][:MAX_EPOCH][-1])
     print('VFM mean AUC', data['metrics']['test']['auc_all'][:MAX_EPOCH][-1])
     print('VFM mean MAP', data['metrics']['test']['map_all'][:MAX_EPOCH][-1])
